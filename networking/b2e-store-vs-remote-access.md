@@ -142,6 +142,47 @@ remote        → минимальный доступ + строгий rate limi
 
 ---
 
+## 🔍 Получение реального IP клиента
+
+HAProxy должен видеть реальный IP, а не IP Mikrotik. Разбор по случаям:
+
+| Путь | Что видит HAProxy | Причина |
+|------|------------------|---------|
+| Приватный WiFi | RFC1918 IP клиента ✅ | Mikrotik роутит без NAT |
+| Публичный WiFi | Публичный IP магазина ✅ | Нужный IP для ACL — всё ок |
+| Удалёнка | Реальный IP юзера ✅ | Прямое подключение |
+
+**Для приватного WiFi — проверить Masquerade на Mikrotik:**
+```bash
+# Mikrotik CLI
+/ip firewall nat print
+```
+Если есть `action=masquerade` на маршруте internal→internal — HAProxy будет видеть IP Mikrotik вместо клиента. Добавить исключение:
+```
+/ip firewall nat add chain=srcnat \
+    src-address=10.0.0.0/8 dst-address=10.0.0.0/8 \
+    action=accept place-before=0
+```
+
+**HAProxy — правильная обработка X-Forwarded-For:**
+```haproxy
+frontend b2e_public
+    option forwardfor
+    # Доверять XFF только от известных внутренних прокси
+    http-request set-header X-Real-IP %[req.hdr(X-Forwarded-For,-1)] \
+        if { src 10.0.0.0/8 192.168.0.0/16 }
+    http-request set-header X-Real-IP %[src] \
+        if !{ req.hdr(X-Forwarded-For) -m found }
+```
+
+**Если перед HAProxy ещё один балансировщик — PROXY Protocol (лучший вариант):**
+```haproxy
+frontend b2e_public
+    bind *:443 ssl crt /etc/ssl/certs/b2e.pem accept-proxy
+```
+
+---
+
 ## 💡 Подводные камни
 
 - **IP-список надо обновлять** при открытии/переезде магазина. Желательно автоматизировать через Ansible/скрипт + reload HAProxy (`haproxy -sf $(cat /run/haproxy.pid)`)
