@@ -8,7 +8,10 @@
 5. [PITR — Point-in-Time Recovery](#pitr--point-in-time-recovery)
 6. [Перенос БД между инстансами](#перенос-бд-между-инстансами)
 7. [Синхронизация и переливка данных](#синхронизация-и-переливка-данных)
-8. [Рекомендации и подводные камни](#рекомендации-и-подводные-камни)
+8. [Сторонние инструменты бэкапа](#сторонние-инструменты-бэкапа)
+9. [CDC и Kafka / Debezium](#cdc-и-kafka--debezium)
+10. [UI-инструменты](#ui-инструменты)
+11. [Рекомендации и подводные камни](#рекомендации-и-подводные-камни)
 
 ---
 
@@ -352,7 +355,426 @@ SELECT pglogical.create_subscription('mysub',
 
 ---
 
-## Рекомендации и подводные камни
+## Сторонние инструменты бэкапа
+
+### pgBackRest
+
+Де-факто стандарт для продакшн-бэкапов PostgreSQL. Инкрементальные бэкапы, параллельность, шифрование, поддержка S3/GCS/Azure.
+
+```bash
+# Установка
+apt install pgbackrest
+
+# /etc/pgbackrest/pgbackrest.conf
+[global]
+repo1-path=/backup/pgbackrest
+repo1-retention-full=2
+repo1-cipher-type=aes-256-cbc
+repo1-cipher-pass=secretpassword
+
+[mydb]
+pg1-path=/var/lib/postgresql/17/main
+
+# Инициализация репозитория
+pgbackrest --stanza=mydb stanza-create
+
+# Полный бэкап
+pgbackrest --stanza=mydb --type=full backup
+
+# Инкрементальный
+pgbackrest --stanza=mydb --type=incr backup
+
+# Дифференциальный (от последнего full)
+pgbackrest --stanza=mydb --type=diff backup
+
+# Список бэкапов
+pgbackrest --stanza=mydb info
+
+# Восстановление
+systemctl stop postgresql
+pgbackrest --stanza=mydb restore
+
+# PITR — восстановление на момент времени
+pgbackrest --stanza=mydb restore \
+  --target="2026-02-25 12:00:00" \
+  --target-action=promote
+
+# Бэкап в S3
+# repo1-type=s3
+# repo1-s3-bucket=my-bucket
+# repo1-s3-endpoint=s3.amazonaws.com
+# repo1-s3-region=us-east-1
+# repo1-s3-key=AKIAIOSFODNN7
+# repo1-s3-key-secret=secret
+```
+
+**UI:** нет встроенного. Сторонние:
+- [pgbackrest-exporter](https://github.com/woblerr/pgbackrest_exporter) — Prometheus-экспортер → Grafana
+
+---
+
+### Barman
+
+Backup and Recovery Manager от 2ndQuadrant (EnterpriseDB). Централизованный сервер бэкапов для нескольких PostgreSQL-инстансов.
+
+```bash
+# Установка
+apt install barman barman-cli
+
+# /etc/barman/barman.conf
+[barman]
+barman_home = /var/lib/barman
+barman_user = barman
+log_file = /var/log/barman/barman.log
+
+# /etc/barman/conf.d/myserver.conf
+[myserver]
+description = "My PostgreSQL Server"
+conninfo = host=pghost user=barman dbname=postgres
+backup_method = postgres        # или rsync
+streaming_conninfo = host=pghost user=streaming_barman
+streaming_archiver = on
+backup_compression = gzip
+retention_policy = RECOVERY WINDOW OF 7 DAYS
+
+# Проверка конфигурации
+barman check myserver
+
+# Полный бэкап
+barman backup myserver
+
+# Список бэкапов
+barman list-backups myserver
+
+# Восстановление
+barman recover myserver latest /var/lib/postgresql/17/main
+
+# PITR
+barman recover myserver latest /var/lib/postgresql/17/main \
+  --target-time "2026-02-25 12:00:00"
+```
+
+**UI:** нет встроенного. Управление через CLI. Метрики — через `barman-exporter` → Grafana.
+
+---
+
+### WAL-G
+
+Минималистичный и быстрый инструмент для WAL-архивирования и бэкапов в облако (S3, GCS, Azure, Swift). Написан на Go.
+
+```bash
+# Установка
+curl -L https://github.com/wal-g/wal-g/releases/latest/download/wal-g-pg-ubuntu-20.04-amd64 \
+  -o /usr/local/bin/wal-g && chmod +x /usr/local/bin/wal-g
+
+# Переменные окружения (или .walg.json)
+export WALG_S3_PREFIX=s3://my-bucket/pg-backups
+export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7
+export AWS_SECRET_ACCESS_KEY=secret
+export AWS_REGION=us-east-1
+export PGHOST=localhost
+export PGUSER=postgres
+
+# postgresql.conf — архивирование WAL через wal-g
+archive_mode = on
+archive_command = 'wal-g wal-push %p'
+restore_command = 'wal-g wal-fetch %f %p'
+
+# Полный бэкап
+wal-g backup-push /var/lib/postgresql/17/main
+
+# Список бэкапов
+wal-g backup-list
+
+# Восстановление последнего бэкапа
+wal-g backup-fetch /var/lib/postgresql/17/main LATEST
+
+# PITR
+WALG_SENTINEL_USER_DATA='{"targetTime":"2026-02-25T12:00:00Z"}' \
+  wal-g backup-fetch /var/lib/postgresql/17/main LATEST
+```
+
+**UI:** нет. Но есть [wal-g-exporter](https://github.com/camptocamp/wal-g-exporter) для Prometheus/Grafana.
+
+---
+
+### Restic
+
+Универсальный инструмент бэкапа (не специфичен для PostgreSQL). Подходит для бэкапа файлов БД или дампов.
+
+```bash
+# Инициализация репозитория
+restic -r s3:s3.amazonaws.com/my-bucket/pg init
+
+# Сценарий: дамп + бэкап через pipe (без tmp-файла)
+pg_dump -U postgres -d mydb -Fc \
+  | restic -r s3:s3.amazonaws.com/my-bucket/pg backup \
+    --stdin --stdin-filename mydb.dump
+
+# Бэкап директории с файлами PG (при остановленном сервере)
+restic -r /backup/restic backup /var/lib/postgresql/17/main
+
+# Список снэпшотов
+restic -r /backup/restic snapshots
+
+# Восстановление
+restic -r /backup/restic restore latest --target /restore/pg
+
+# Политика хранения
+restic -r /backup/restic forget \
+  --keep-daily 7 --keep-weekly 4 --keep-monthly 6 \
+  --prune
+```
+
+**UI:** [Restic Browser](https://github.com/emuell/restic-browser) — десктопное приложение для просмотра снэпшотов.
+
+---
+
+### Сравнение инструментов
+
+| | pgBackRest | Barman | WAL-G | Restic |
+|--|------------|--------|-------|--------|
+| PostgreSQL-специфичен | ✅ | ✅ | ✅ | ❌ |
+| Инкрементальный бэкап | ✅ | ✅ | ✅ (WAL) | ✅ |
+| PITR | ✅ | ✅ | ✅ | ❌ |
+| Облачное хранилище | ✅ | ❌ | ✅ | ✅ |
+| Шифрование | ✅ | ✅ | ✅ | ✅ |
+| Параллельность | ✅ | ✅ | ✅ | ✅ |
+| Несколько серверов | ❌ | ✅ | ❌ | ✅ |
+| Встроенный UI | ❌ | ❌ | ❌ | ❌ |
+
+> **Рекомендация:** для продакшена — **pgBackRest** (один сервер) или **Barman** (несколько серверов). Для облака с минимальной настройкой — **WAL-G**.
+
+---
+
+## CDC и Kafka / Debezium
+
+CDC (Change Data Capture) — захват изменений из WAL PostgreSQL и стриминг в Kafka. Используется для real-time синхронизации, event-driven архитектуры, аналитики.
+
+### Архитектура
+
+```
+PostgreSQL WAL → Debezium Connector → Kafka Topic → Consumers (другой PostgreSQL, ClickHouse, ES, etc.)
+```
+
+### Настройка PostgreSQL для Debezium
+
+```conf
+# postgresql.conf
+wal_level = logical
+max_replication_slots = 4
+max_wal_senders = 4
+```
+
+```sql
+-- Создать пользователя для Debezium
+CREATE USER debezium REPLICATION LOGIN PASSWORD 'password';
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO debezium;
+
+-- или через publication
+CREATE PUBLICATION debezium_pub FOR ALL TABLES;
+```
+
+### Docker Compose — Kafka + Debezium
+
+```yaml
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    depends_on: [zookeeper]
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    ports:
+      - "9092:9092"
+
+  kafka-connect:
+    image: debezium/connect:2.7
+    depends_on: [kafka]
+    ports:
+      - "8083:8083"
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: 1
+      CONFIG_STORAGE_TOPIC: connect-configs
+      OFFSET_STORAGE_TOPIC: connect-offsets
+      STATUS_STORAGE_TOPIC: connect-status
+
+  debezium-ui:
+    image: debezium/debezium-ui:2.7
+    depends_on: [kafka-connect]
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CONNECT_URIS: http://kafka-connect:8083
+```
+
+### Создание коннектора через REST API
+
+```bash
+curl -X POST http://localhost:8083/connectors \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "pg-connector",
+    "config": {
+      "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+      "database.hostname": "postgres_host",
+      "database.port": "5432",
+      "database.user": "debezium",
+      "database.password": "password",
+      "database.dbname": "mydb",
+      "database.server.name": "mydb",
+      "topic.prefix": "mydb",
+      "table.include.list": "public.users,public.orders",
+      "plugin.name": "pgoutput",
+      "publication.name": "debezium_pub",
+      "slot.name": "debezium_slot",
+      "snapshot.mode": "initial"
+    }
+  }'
+
+# Статус коннектора
+curl http://localhost:8083/connectors/pg-connector/status
+
+# Список топиков (изменения попадают в mydb.public.users и т.д.)
+kafka-topics.sh --bootstrap-server localhost:9092 --list
+
+# Читать изменения
+kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 \
+  --topic mydb.public.users \
+  --from-beginning
+```
+
+### Формат сообщений Debezium
+
+```json
+{
+  "op": "c",        // c=create, u=update, d=delete, r=read(snapshot)
+  "before": null,   // состояние до (null для INSERT)
+  "after": {        // состояние после
+    "id": 1,
+    "name": "Alice"
+  },
+  "source": {
+    "db": "mydb",
+    "table": "users",
+    "lsn": 12345
+  },
+  "ts_ms": 1740477600000
+}
+```
+
+### Kafka UI
+
+Несколько вариантов:
+
+**Debezium UI** (официальный) — управление коннекторами:
+```
+http://localhost:8080
+```
+
+**Kafka UI** (провия) — полный UI для Kafka:
+```yaml
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    ports:
+      - "8090:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: connect
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: http://kafka-connect:8083
+```
+
+**Redpanda Console** — альтернатива, красивый UI:
+```yaml
+  redpanda-console:
+    image: redpandadata/console:latest
+    ports:
+      - "8091:8080"
+    environment:
+      KAFKA_BROKERS: kafka:9092
+      CONNECT_ENABLED: "true"
+      CONNECT_CLUSTERS_0_NAME: connect
+      CONNECT_CLUSTERS_0_URL: http://kafka-connect:8083
+```
+
+### Kafka JDBC Sink — запись из Kafka обратно в PostgreSQL
+
+```bash
+curl -X POST http://localhost:8083/connectors \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "pg-sink",
+    "config": {
+      "connector.class": "io.confluent.connect.jdbc.JdbcSinkConnector",
+      "connection.url": "jdbc:postgresql://target_host:5432/targetdb",
+      "connection.user": "postgres",
+      "connection.password": "password",
+      "topics": "mydb.public.users",
+      "insert.mode": "upsert",
+      "pk.mode": "record_key",
+      "pk.fields": "id",
+      "auto.create": "true",
+      "auto.evolve": "true"
+    }
+  }'
+```
+
+> ⚠️ **Следи за replication slot** — `debezium_slot` накапливает WAL если consumer не читает. Мониторь: `SELECT slot_name, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)) FROM pg_replication_slots;`
+
+---
+
+## UI-инструменты
+
+### pgAdmin 4
+
+Официальный веб-UI для PostgreSQL. Есть встроенный backup/restore.
+
+```yaml
+# Docker Compose
+services:
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    ports:
+      - "5050:80"
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@admin.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+```
+
+Backup через UI: ПКМ на БД → Backup → выбрать формат, флаги `--no-owner`, `--no-privileges`.
+
+### DBeaver
+
+Десктопное приложение. Database → Tools → Backup / Restore. Под капотом вызывает `pg_dump`/`pg_restore`.
+
+### TablePlus
+
+Десктопное (macOS/Windows/Linux). Быстрый UI, есть базовый dump через меню.
+
+### Adminer
+
+Легковесный PHP-UI. Нет встроенного pg_dump, но есть экспорт таблиц в SQL/CSV.
+
+```yaml
+  adminer:
+    image: adminer:latest
+    ports:
+      - "8080:8080"
+```
+
+---
 
 ### Бэкап
 
