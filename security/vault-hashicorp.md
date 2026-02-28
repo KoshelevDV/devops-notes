@@ -888,6 +888,7 @@ curl https://vault:8200/v1/sys/metrics?format=prometheus
 
 ## 📎 Документация
 
+- [Bank-Vaults operator — установка и опции](./bank-vaults-operator.md) ← K8s operator поверх Vault
 - [Vault Docs](https://developer.hashicorp.com/vault/docs)
 - [Vault Architecture](https://developer.hashicorp.com/vault/docs/internals/architecture)
 - [Integrated Storage (Raft)](https://developer.hashicorp.com/vault/docs/configuration/storage/raft)
