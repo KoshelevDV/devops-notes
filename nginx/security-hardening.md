@@ -272,6 +272,140 @@ bantime  = 3600
 
 ---
 
+## 10. Path Traversal — защита и типичные баги
+
+### Главный баг: `alias` без trailing slash
+
+Самая классическая уязвимость nginx — несоответствие trailing slash у `location` и `alias`:
+
+```nginx
+# ❌ УЯЗВИМО
+location /static {
+    alias /var/www/static/;
+}
+# GET /static../etc/passwd → читает /var/www/etc/passwd (или выше)
+```
+
+```nginx
+# ✅ ПРАВИЛЬНО — trailing slash у обоих
+location /static/ {
+    alias /var/www/static/;
+}
+```
+
+Проверить:
+```bash
+curl -v "https://example.com/static../etc/passwd"
+curl -v "https://example.com/static..%2fetc%2fpasswd"
+# Должен быть 400 или 404, не 200
+```
+
+`gixy` ловит этот баг автоматически — прогонять обязательно.
+
+---
+
+### `$uri` vs `$request_uri` — нормализация путей
+
+`$uri` — **нормализованный** путь (nginx декодирует `%2f`, убирает `..`).  
+`$request_uri` — **сырой** путь от клиента, без нормализации.
+
+```nginx
+# ❌ Опасно в proxy_pass с $request_uri — передаёт сырой путь в upstream
+proxy_pass http://backend$request_uri;
+
+# ✅ Безопаснее — nginx нормализует перед проксированием
+proxy_pass http://backend$uri$is_args$args;
+```
+
+Правило: используй `$uri` если нет явной причины брать `$request_uri`.
+
+---
+
+### `merge_slashes off` — осторожно
+
+По умолчанию nginx схлопывает `/foo//bar` → `/foo/bar`. Некоторые отключают это для совместимости:
+
+```nginx
+# ❌ Потенциально опасно
+merge_slashes off;
+```
+
+При `merge_slashes off` двойные слеши могут обходить `location`-матчи и WAF-правила. Не отключай без крайней необходимости.
+
+---
+
+### Double encoding и null bytes
+
+```bash
+# Атакующий пробует:
+GET /files/%2e%2e%2fetc%2fpasswd    # декодируется в ../etc/passwd
+GET /files/..%252f..%252fetc/passwd # double-encoded %25 = %
+GET /files/%00/../etc/passwd        # null byte (в старых версиях)
+```
+
+Nginx сам декодирует первый уровень и нормализует путь — это защищает от большинства случаев. Но если upstream (PHP, Python, Java) делает **повторное декодирование** — он получает уже ненормализованный путь.
+
+Защита:
+```nginx
+# Отклонять запросы с %00 (null byte)
+if ($request_uri ~* "%00") {
+    return 400;
+}
+
+# Отклонять явные попытки path traversal в сыром URI
+if ($request_uri ~* "\.\./") {
+    return 400;
+}
+```
+
+---
+
+### Ограничить корень через `root` + `try_files`
+
+Вместо `alias` для статики лучше использовать `root` + `try_files` — меньше шансов ошибиться:
+
+```nginx
+server {
+    root /var/www/html;
+
+    location /static/ {
+        try_files $uri =404;
+        # nginx сам ограничен root-директорией
+    }
+}
+```
+
+---
+
+### Запретить `..` в URI на уровне сервера
+
+```nginx
+server {
+    # Блокировать попытки path traversal глобально
+    if ($request_uri ~* "(\.\.|%2e%2e)") {
+        return 400;
+    }
+}
+```
+
+⚠️ `if` в nginx — опасная конструкция, но для простых проверок `$request_uri` допустима. Не использовать `if` внутри `location` для проксирования.
+
+---
+
+### Чеклист по path traversal
+
+```
+[ ] alias — trailing slash совпадает у location и alias (gixy проверит)
+[ ] $request_uri не используется напрямую в proxy_pass без нормализации
+[ ] merge_slashes не выключен без причины
+[ ] Блок на %2e%2e / .. в $request_uri
+[ ] Статика отдаётся через root + try_files, не через alias (где возможно)
+[ ] gixy прогнан — нет предупреждений по path traversal
+[ ] Upstream не делает повторное декодирование URI
+```
+
+---
+
 ## 📎 Документация
 
 - [Mozilla SSL Config Generator](https://ssl-config.mozilla.org/) — генератор правильного TLS
