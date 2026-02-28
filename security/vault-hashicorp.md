@@ -902,3 +902,684 @@ curl https://vault:8200/v1/sys/metrics?format=prometheus
 - [Vault Production Hardening Guide](https://developer.hashicorp.com/vault/tutorials/operations/production-hardening)
 - [HA with Integrated Storage Tutorial](https://developer.hashicorp.com/vault/tutorials/raft/raft-storage)
 - [Vault on Kubernetes — Best Practices](https://developer.hashicorp.com/vault/tutorials/kubernetes/kubernetes-raft-deployment-guide)
+
+---
+
+## 🔖 Реальные кейсы использования
+
+---
+
+### KV v2 — Конфигурация микросервисов
+
+**Кейс: Замена ConfigMap + env vars в Kubernetes**
+
+Проблема: в команде 15 микросервисов, каждый хранит `DB_URL`, `REDIS_URL`, `API_KEY` в ConfigMap и Secrets. При ротации ключа нужно вручную обновить 15 манифестов и рестартовать поды.
+
+Решение: Все конфиги в Vault KV v2, Vault Agent Injector монтирует их как файлы.
+
+```
+Структура ключей:
+secret/
+  payments-service/
+    prod/
+      db_url
+      stripe_key
+      redis_url
+    staging/
+      db_url
+      stripe_key
+  orders-service/
+    prod/
+      db_url
+      kafka_bootstrap
+```
+
+```yaml
+# Deployment — только аннотации, никаких env vars с секретами
+annotations:
+  vault.hashicorp.com/agent-inject: "true"
+  vault.hashicorp.com/role: "payments-service"
+  vault.hashicorp.com/agent-inject-secret-config: "secret/data/payments-service/prod"
+  vault.hashicorp.com/agent-inject-template-config: |
+    {{- with secret "secret/data/payments-service/prod" -}}
+    DB_URL={{ .Data.data.db_url }}
+    STRIPE_KEY={{ .Data.data.stripe_key }}
+    {{- end }}
+```
+
+```python
+# В приложении — читаем из файла, не из env:
+import os
+
+def load_config():
+    config = {}
+    with open("/vault/secrets/config") as f:
+        for line in f:
+            key, _, value = line.strip().partition("=")
+            config[key] = value
+    return config
+```
+
+При смене `stripe_key`: `vault kv put secret/payments-service/prod stripe_key=новый` → Vault Agent подхватывает изменение без рестарта пода.
+
+---
+
+**Кейс: Версионирование конфигов для rollback**
+
+Деплой пошёл не так — в новой версии config оказался неправильный DSN.
+
+```bash
+# Посмотреть историю:
+vault kv history secret/payments-service/prod
+
+# Откатиться к версии 5:
+vault kv get -version=5 secret/payments-service/prod
+vault kv get -version=5 -format=json secret/payments-service/prod \
+  | jq '.data.data' \
+  | vault kv put secret/payments-service/prod -
+```
+
+Откат занимает 30 секунд вместо передеплоя.
+
+---
+
+### Database — Динамические credentials
+
+**Кейс: Zero-trust доступ к PostgreSQL**
+
+Проблема: один статический пользователь `app_user` с паролем в конфиге. Пароль живёт годами, ротация ломает продакшен, при взломе сервера злоумышленник получает постоянный доступ к БД.
+
+```
+До:  app → DB (статичный app_user/password навсегда)
+После: app → Vault → DB (временный v-app-abcd1234 / password на 1 час)
+```
+
+```bash
+# Vault создаёт пользователя при каждом запросе:
+vault read database/creds/app-readonly
+
+# Key              Value
+# lease_id         database/creds/app-readonly/AbCdEfGhIjKlMnOp
+# lease_duration   1h
+# username         v-approle-app-abcd-1234567890
+# password         A-xYzAbCd1234...
+```
+
+```python
+# Spring Boot — автоматическое обновление credentials через Vault Spring:
+# application.yml
+spring:
+  cloud:
+    vault:
+      database:
+        role: app-readonly
+        backend: database
+      config:
+        lifecycle:
+          enabled: true
+          min-renewal: 10s   # обновлять за 10s до истечения
+```
+
+**Кейс: Incident response — скомпрометированный сервис**
+
+Сервис `payments-service` был взломан. Нужно немедленно отозвать его доступ к БД.
+
+```bash
+# Отозвать ВСЕ credentials выданные этой роли — за 1 команду:
+vault lease revoke -prefix database/creds/payments-readonly/
+
+# Все временные пользователи v-payments-* немедленно удалены из PostgreSQL.
+# Злоумышленник теряет доступ через секунды, без изменения основного пользователя.
+```
+
+Статические credentials: пришлось бы менять пароль + деплоить всё заново. Vault: одна команда.
+
+---
+
+**Кейс: Аналитики и разработчики — временный read-only доступ**
+
+```bash
+# DevOps выдаёт аналитику временный доступ на 4 часа:
+vault write database/roles/analyst-temp \
+  db_name=mydb \
+  creation_statements="CREATE ROLE \"{{name}}\" WITH LOGIN PASSWORD '{{password}}' VALID UNTIL '{{expiration}}'; GRANT SELECT ON analytics_schema.* TO \"{{name}}\";" \
+  default_ttl=4h \
+  max_ttl=4h
+
+vault read database/creds/analyst-temp
+# Пользователь автоматически удаляется через 4 часа — даже если аналитик забудет выйти.
+```
+
+---
+
+### PKI — Сертификаты
+
+**Кейс: mTLS между микросервисами (service mesh без Istio)**
+
+Проблема: 20 микросервисов должны проверять друг друга через TLS. Управлять 20 парами сертификатов вручную невозможно.
+
+```
+payments-service (cert valid 24h) → Vault PKI → orders-service (cert valid 24h)
+                                   ↕ авторенью через 20 часов
+```
+
+```bash
+# Каждый сервис получает свой сертификат при старте:
+vault write pki_int/issue/microservices \
+  common_name="payments-service.production.svc" \
+  alt_names="payments-service,payments-service.production" \
+  ttl=24h
+
+# Сертификат действует 24 часа — если сервис взломан,
+# максимальный blast radius 24 часа без каких-либо действий оператора.
+```
+
+```python
+# Python — автоматический renew через библиотеку hvac:
+import hvac, ssl, threading, time
+
+def renew_cert(vault_client, role, domain):
+    while True:
+        cert_data = vault_client.secrets.pki.generate_certificate(
+            name=role,
+            common_name=domain,
+            extra_params={"ttl": "24h"}
+        )
+        # Обновить SSL context в рантайме
+        update_ssl_context(cert_data)
+        # Обновить за 4 часа до истечения (20h из 24h)
+        time.sleep(20 * 3600)
+
+threading.Thread(target=renew_cert, args=(client, "microservices", "payments-service.production.svc"), daemon=True).start()
+```
+
+---
+
+**Кейс: cert-manager + Vault PKI для Kubernetes Ingress**
+
+```yaml
+# ClusterIssuer — cert-manager выдаёт сертификаты через Vault
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: vault-issuer
+spec:
+  vault:
+    path: pki_int/sign/kubernetes-ingress
+    server: https://vault.vault:8200
+    auth:
+      kubernetes:
+        role: cert-manager
+        mountPath: /v1/auth/kubernetes
+        serviceAccountRef:
+          name: cert-manager
+
+---
+# Ingress — сертификат выдаётся и обновляется автоматически
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  annotations:
+    cert-manager.io/cluster-issuer: vault-issuer
+spec:
+  tls:
+    - hosts: [api.myapp.com]
+      secretName: api-tls
+  rules:
+    - host: api.myapp.com
+```
+
+Сертификат обновляется за 30 дней до истечения автоматически — человек не участвует.
+
+---
+
+**Кейс: Замена wildcard-сертификата**
+
+Проблема: единый wildcard `*.myapp.com` → если скомпрометирован, падает всё. Ротация раз в год руками.
+
+После: каждый сервис получает отдельный сертификат с TTL 7 дней. Автообновление. Компрометация одного → blast radius один сервис.
+
+---
+
+### SSH — Временный доступ
+
+**Кейс: Bastionless SSH — никаких authorized_keys**
+
+Проблема: у 50 серверов в `~/.ssh/authorized_keys` лежат 30 ключей. Уволившийся сотрудник — нужно чистить все 50 серверов. Кто-то забыл → ключ висит годами.
+
+```bash
+# Оператор получает подписанный SSH-сертификат на 1 час:
+vault write ssh/sign/sre \
+  public_key=@~/.ssh/id_ed25519.pub \
+  valid_principals=ubuntu \
+  ttl=1h
+
+# Подключение с подписанным сертификатом:
+ssh -i ~/.ssh/id_ed25519-cert.pub ubuntu@server-ip
+```
+
+```bash
+# На каждом сервере — один раз при provisioning:
+# /etc/ssh/sshd_config
+TrustedUserCAKeys /etc/ssh/vault_ca.pub
+
+# Никаких authorized_keys — доступ по политике Vault.
+# Уволился сотрудник → удалить из Vault → доступ пропадает мгновенно.
+```
+
+---
+
+**Кейс: Временный доступ подрядчику**
+
+```bash
+# Создать роль с ограниченным временем и конкретным пользователем:
+vault write auth/userpass/users/contractor \
+  password=temppassword \
+  policies=ssh-readonly-policy
+
+# policy:
+path "ssh/sign/readonly-role" {
+  capabilities = ["update"]
+}
+
+# Подрядчик логинится и получает SSH cert на 8 часов.
+# После истечения — доступа нет без повторного запроса.
+```
+
+---
+
+### AWS — Динамические IAM credentials
+
+**Кейс: CI/CD pipeline без долгосрочных AWS ключей**
+
+Проблема: `AWS_ACCESS_KEY_ID` и `AWS_SECRET_ACCESS_KEY` лежат в GitLab CI Variables, живут годами, имеют широкие права.
+
+```
+До:  GitLab Runner → статичный IAM User (ключ 2 года, права Admin)
+После: GitLab Runner → Vault JWT Auth → Vault AWS Engine → временный IAM (15 мин, только S3 push)
+```
+
+```yaml
+# .gitlab-ci.yml
+deploy:
+  script:
+    # Получить временный токен Vault через GitLab OIDC
+    - export VAULT_TOKEN=$(vault write -field=token auth/jwt/login
+        role=gitlab-deploy jwt=$CI_JOB_JWT_V2)
+    # Получить временные AWS credentials
+    - export $(vault read -format=json aws/creds/deploy-role
+        | jq -r '.data | to_entries[] | "\(.key | ascii_upcase)=\(.value)"')
+    # Деплой
+    - aws s3 sync dist/ s3://my-bucket/
+  after_script:
+    - vault lease revoke $LEASE_ID   # сразу отзываем после job
+```
+
+**Кейс: Lambda без embedded credentials**
+
+```python
+# Lambda function — получает credentials из Vault при старте
+import boto3
+import hvac
+
+def lambda_handler(event, context):
+    # Lambda использует IAM Role для авторизации в Vault
+    vault = hvac.Client(url="https://vault.internal:8200")
+    vault.auth.aws.iam_login(role="lambda-s3-reader")
+    
+    s3_creds = vault.read("aws/creds/s3-reader")["data"]
+    
+    s3 = boto3.client("s3",
+        aws_access_key_id=s3_creds["access_key"],
+        aws_secret_access_key=s3_creds["secret_key"]
+    )
+    # s3_creds истекут через 15 минут — раньше чем Lambda timeout
+```
+
+---
+
+### Transit — Encryption as a Service
+
+**Кейс: Шифрование PII в базе данных (GDPR/PCI)**
+
+Проблема: таблица `users` хранит `email`, `phone`, `card_number` в открытом виде. Утечка БД = компрометация данных всех пользователей.
+
+```python
+import hvac, base64
+from sqlalchemy import Column, String
+
+vault = hvac.Client(url="https://vault:8200")
+vault.auth.kubernetes.login(role="payments-app", jwt=open("/var/run/secrets/...token").read())
+
+def encrypt_field(plaintext: str) -> str:
+    """Шифрует перед записью в БД"""
+    resp = vault.secrets.transit.encrypt_data(
+        name="user-pii",
+        plaintext=base64.b64encode(plaintext.encode()).decode()
+    )
+    return resp["data"]["ciphertext"]  # vault:v1:AbCdEf...
+
+def decrypt_field(ciphertext: str) -> str:
+    """Расшифровывает при чтении"""
+    resp = vault.secrets.transit.decrypt_data(
+        name="user-pii",
+        ciphertext=ciphertext
+    )
+    return base64.b64decode(resp["data"]["plaintext"]).decode()
+
+# В БД хранится: vault:v1:AbCdEfGhIjKlMnOpQrStUvWxYz...
+# Утечка БД = зашифрованный мусор без доступа к Vault
+```
+
+**Ротация ключа шифрования без расшифровки всех записей:**
+
+```bash
+# Ротировать ключ — старые данные остаются читаемы:
+vault write -f transit/keys/user-pii/rotate
+
+# Перешифровать все записи новым ключом (в фоне):
+vault write transit/rewrap/user-pii ciphertext="vault:v1:старый_шифртекст"
+# → vault:v2:новый_шифртекст
+
+# Запретить расшифровку старых версий ключа:
+vault write transit/keys/user-pii/config min_decryption_version=2
+```
+
+---
+
+**Кейс: Подпись токенов / данных (замена self-signed JWT)**
+
+```python
+# Подписывать критичные операции (переводы, смена пароля):
+def sign_transfer(transfer_data: dict) -> str:
+    payload = json.dumps(transfer_data).encode()
+    resp = vault.secrets.transit.sign_data(
+        name="transfer-signing-key",
+        hash_input=base64.b64encode(payload).decode(),
+        hash_algorithm="sha2-256",
+        signature_algorithm="pkcs1v15"
+    )
+    return resp["data"]["signature"]
+
+def verify_transfer(transfer_data: dict, signature: str) -> bool:
+    payload = json.dumps(transfer_data).encode()
+    resp = vault.secrets.transit.verify_signed_data(
+        name="transfer-signing-key",
+        hash_input=base64.b64encode(payload).decode(),
+        signature=signature
+    )
+    return resp["data"]["valid"]
+```
+
+Ключ никогда не покидает Vault → компрометация приложения не даёт доступ к ключу подписи.
+
+---
+
+### AppRole — Интеграция CI/CD и сервисов
+
+**Кейс: Terraform Cloud получает credentials для деплоя**
+
+```bash
+# Terraform Cloud runner логинится через AppRole:
+# RoleID — публичный, в конфиге Terraform
+# SecretID — выдаётся оператором разово через CI/CD orchestrator
+
+# Terraform provider:
+provider "vault" {
+  address = "https://vault.example.com"
+  auth_login_approle {
+    role_id   = var.vault_role_id
+    secret_id = var.vault_secret_id  # из env TF_VAR_vault_secret_id
+  }
+}
+
+# Получить credentials для AWS деплоя:
+data "vault_aws_access_credentials" "deploy" {
+  backend = "aws"
+  role    = "terraform-deploy"
+}
+
+provider "aws" {
+  access_key = data.vault_aws_access_credentials.deploy.access_key
+  secret_key = data.vault_aws_access_credentials.deploy.secret_key
+}
+```
+
+---
+
+**Кейс: Response Wrapping — безопасная доставка SecretID**
+
+Проблема: как доставить SecretID в приложение, не засветив его?
+
+```bash
+# Orchestrator (Nomad, K8s init container) получает wrapped SecretID:
+# Wrapped token живёт 60 секунд и может быть использован только 1 раз.
+WRAPPED=$(vault write -wrap-ttl=60s -f auth/approle/role/myapp/secret-id \
+  -format=json | jq -r '.wrap_info.token')
+
+# Передать WRAPPED в приложение (через env, init container)
+# Приложение разворачивает:
+SECRET_ID=$(vault unwrap -field=secret_id $WRAPPED)
+vault write auth/approle/login role_id=$ROLE_ID secret_id=$SECRET_ID
+# WRAPPED больше нельзя использовать — перехват бесполезен
+```
+
+---
+
+### Kubernetes Auth — Pod получает секреты без env vars
+
+**Кейс: Spring Boot приложение без secret в манифесте**
+
+```yaml
+# Манифест полностью без секретов — только Service Account:
+apiVersion: apps/v1
+kind: Deployment
+spec:
+  template:
+    metadata:
+      annotations:
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/role: "payments-service"
+        vault.hashicorp.com/agent-inject-secret-application: "secret/data/payments-service/prod"
+        vault.hashicorp.com/agent-inject-template-application: |
+          {{- with secret "secret/data/payments-service/prod" -}}
+          spring.datasource.url={{ .Data.data.db_url }}
+          spring.datasource.password={{ .Data.data.db_password }}
+          stripe.api.key={{ .Data.data.stripe_key }}
+          {{- end }}
+        vault.hashicorp.com/agent-inject-file-application: "application.properties"
+    spec:
+      serviceAccountName: payments-service-sa
+      containers:
+        - name: app
+          image: payments-service:latest
+          # Никаких env с секретами — приложение читает /vault/secrets/application.properties
+```
+
+```
+git blame → ни в одном коммите нет пароля от БД.
+kubectl get secret → нет K8s Secrets с credentials.
+kubectl describe pod → нет env vars с секретами.
+```
+
+---
+
+**Кейс: Init container подготавливает secrets для legacy-приложения**
+
+Legacy-приложение читает secrets из файлов и не умеет в Vault SDK.
+
+```yaml
+initContainers:
+  - name: vault-init
+    image: hashicorp/vault:1.17
+    command: ["/bin/sh", "-c"]
+    args:
+      - |
+        vault login -method=kubernetes role=legacy-app \
+          jwt=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+        vault kv get -field=db_password secret/legacy/prod > /secrets/db_password
+        vault kv get -field=api_key secret/legacy/prod > /secrets/api_key
+    volumeMounts:
+      - mountPath: /secrets
+        name: secrets-vol
+containers:
+  - name: legacy-app
+    volumeMounts:
+      - mountPath: /app/secrets
+        name: secrets-vol
+        readOnly: true
+volumes:
+  - name: secrets-vol
+    emptyDir:
+      medium: Memory   # tmpfs — секреты не пишутся на диск
+```
+
+---
+
+### Auto-Unseal — Операционные сценарии
+
+**Кейс: Vault в Kubernetes рестартует без участия оператора**
+
+```
+Без auto-unseal:                    С auto-unseal (AWS KMS):
+vault pod killed                    vault pod killed
+  ↓                                   ↓
+vault restarts → SEALED             vault restarts
+  ↓                                   ↓ (автоматически)
+PagerDuty → дежурный               vault unseal via KMS
+  ↓ 2 AM                             ↓ ~5 секунд
+оператор вводит 3 ключа             vault READY
+  ↓ 15 минут даунтайм               нет даунтайма, никто не просыпался
+vault READY
+```
+
+```bash
+# Проверить статус unseal:
+vault status | grep -E "Sealed|Unseal"
+# Sealed: false
+# Unseal Progress: 0/0  ← auto-unseal, ключи не нужны
+```
+
+**Recovery keys** (вместо unseal keys при auto-unseal) нужны только для:
+- Regeneration root token при его потере
+- Disaster recovery если KMS недоступен
+- Rekey самих recovery ключей
+
+---
+
+### HA — Сценарий отказа
+
+**Кейс: Потеря leader-ноды в продакшене**
+
+```
+Нормальная работа:
+vault-0 (leader) ←→ vault-1 (standby) ←→ vault-2 (standby)
+
+vault-0 падает:
+vault-0 (DOWN)       vault-1 (standby)    vault-2 (standby)
+                          ↓ Raft election (~10s)
+                     vault-1 (NEW LEADER)  vault-2 (standby)
+
+Приложения: ~10 секунд ошибок при election, потом автоматически работают через vault-1.
+```
+
+```bash
+# Мониторинг смены лидера:
+vault operator raft list-peers
+# Node     Address                      State       Voter
+# vault-0  vault-0.vault-internal:8201  follower    true  ← был лидером
+# vault-1  vault-1.vault-internal:8201  leader      true  ← новый лидер
+# vault-2  vault-2.vault-internal:8201  follower    true
+
+# Health check endpoint (для load balancer):
+# Возвращает 200 только для active (leader) ноды:
+curl https://vault-0.vault-internal:8200/v1/sys/health
+# {"initialized":true,"sealed":false,"standby":false,...}
+# standby: false → это лидер
+```
+
+**Load balancer настройка:**
+
+```yaml
+# k8s Service — только активная нода принимает write:
+apiVersion: v1
+kind: Service
+metadata:
+  name: vault-active
+spec:
+  selector:
+    app: vault
+    vault-active: "true"   # label ставится Vault автоматически
+  ports:
+    - port: 8200
+```
+
+---
+
+### Audit — Расследование инцидента
+
+**Кейс: Кто и когда читал секрет**
+
+Пришёл запрос от compliance: "Кто имел доступ к `secret/payments/stripe_key` за последние 30 дней?"
+
+```bash
+# Audit log — каждый запрос записан:
+grep '"path":"secret/data/payments/stripe_key"' /vault/logs/audit.log \
+  | jq -r '[.time, .auth.display_name, .auth.policies[], .request.operation] | @csv' \
+  | sort
+
+# Вывод:
+# "2026-02-01T09:15:32Z","payments-service","payments-policy","read"
+# "2026-02-15T14:22:11Z","john.doe@company","admin-policy","read"
+# "2026-02-20T02:33:44Z","unknown-token","root","read"  ← подозрительно!
+```
+
+```bash
+# Расследование подозрительного доступа:
+# В 2 ночи, root token — кто это?
+grep '"token":"hvs.CAESIAbCd"' /vault/logs/audit.log | jq .auth
+# Найти откуда token, когда создан, отозвать:
+vault token lookup hvs.CAESIAbCd
+vault token revoke hvs.CAESIAbCd
+```
+
+---
+
+## 📐 Архитектура — Типичный production setup
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Kubernetes Cluster                       │
+│                                                             │
+│  ┌──────────────────────────────────────────┐              │
+│  │            Vault HA (3 replicas)         │              │
+│  │  vault-0 (leader) ←Raft→ vault-1,2      │              │
+│  │  Auto-unseal: AWS KMS                   │              │
+│  │  Storage: Integrated Raft 20Gi          │              │
+│  │  Audit: file + syslog → SIEM            │              │
+│  └──────────────┬───────────────────────────┘              │
+│                 │                                           │
+│        Vault Agent Injector                                │
+│                 │                                           │
+│  ┌──────────────┴────────────────────────┐                │
+│  │    Microservices (via K8s Auth)       │                │
+│  │                                       │                │
+│  │  payments-svc → DB creds (1h TTL)    │                │
+│  │  orders-svc → S3 creds (15m TTL)     │                │
+│  │  api-gateway → TLS cert (24h TTL)    │                │
+│  │  notifications → Stripe key (KV v2)  │                │
+│  └───────────────────────────────────────┘                │
+│                                                             │
+│  ┌─────────────────────────────────────┐                  │
+│  │    CI/CD (GitLab via OIDC/JWT)      │                  │
+│  │  runner → AWS creds (15m) → deploy  │                  │
+│  └─────────────────────────────────────┘                  │
+└─────────────────────────────────────────────────────────────┘
+
+External:
+  AWS KMS ← auto-unseal
+  PostgreSQL ← dynamic users
+  AWS IAM ← dynamic access keys
+  Internal CA ← PKI root
+```
+
