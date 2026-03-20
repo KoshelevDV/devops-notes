@@ -443,3 +443,715 @@ helm history elma365 [-n namespace]
 - Встроенные БД (elma365-dbs): https://elma365.com/ru/help/platform/embedded-databases-settings.html
 - PostgreSQL кластер: https://elma365.com/ru/help/platform/configure-postgresql.html
 - Архитектура: https://elma365.com/ru/help/platform/architecture.html
+
+---
+
+## Проверка производительности диска
+
+Медленный диск увеличит задержку запросов в кластере и может нарушить его стабильность.
+
+```bash
+apt install fio
+mkdir test-data
+fio --rw=write --ioengine=sync --fdatasync=1 --directory=test-data --size=100m --bs=2300 --name=mytest
+```
+
+В выводе смотреть `fdatasync` — 99.00th процентиль должен быть **меньше 10ms**.  
+Значение `2000` = 2ms (хорошо), `15000` = 15ms (плохо).  
+Минимальный IOPS записи — по системным требованиям.
+
+---
+
+## Варианты инфраструктуры
+
+| Окружение | Рекомендуемая конфигурация |
+|---|---|
+| Ознакомление | 1 ВМ, встроенные БД, интернет |
+| DEV/TEST | 1–2 ВМ, встроенные/внешние БД |
+| PROD | 1 ВМ + 3 ВМ для внешних БД |
+| PROD (HA) | Несколько ВМ + отказоустойчивые кластеры всех БД |
+
+**PROD-рекомендация для Enterprise/Standard Kubernetes:**
+- Встроенные: RabbitMQ, Valkey/Redis (в k8s через elma365-dbs)
+- Внешние: PostgreSQL, MongoDB, MinIO S3
+- Проксирование S3 в k8s через S3-Gateway
+- Проксирование БД в k8s через DB-Gateway
+
+---
+
+## MinIO / S3 конфигурация
+
+### Установка MinIO (SNSD — Single Node Single Drive)
+
+```bash
+# 1. Подготовить диск (XFS рекомендуется)
+sudo mkdir -p /var/lib/minio/data1
+sudo mkfs.xfs /dev/sdb -L DISK1
+echo "LABEL=DISK1 /var/lib/minio/data1 xfs defaults,noatime 0 2" >> /etc/fstab
+sudo mount -av
+
+# 2. Установка
+wget https://dl.min.io/server/minio/release/linux-amd64/minio
+chmod +x minio && sudo mv minio /usr/local/bin/
+
+# 3. MinIO Client
+wget https://dl.min.io/client/mc/release/linux-amd64/mc
+chmod +x mc && sudo mv mc /usr/local/bin/
+
+# 4. Пользователь
+sudo groupadd -r minio-user
+sudo useradd -M -r -g minio-user minio-user
+sudo chown minio-user:minio-user /var/lib/minio/data1
+sudo mkdir -p /etc/minio/certs/CAs
+sudo chown -R minio-user:minio-user /etc/minio /var/lib/minio
+
+# 5. Сервис systemd
+sudo curl -O https://raw.githubusercontent.com/minio/minio-service/master/linux-systemd/minio.service
+sudo mv minio.service /etc/systemd/system
+```
+
+**Файл `/etc/default/minio`:**
+```ini
+MINIO_VOLUMES="/var/lib/minio/data1/minio"
+MINIO_OPTS="--certs-dir /etc/minio/certs --console-address :9001"
+MINIO_REGION="ru-central-1"
+MINIO_ROOT_USER=elma365user
+MINIO_ROOT_PASSWORD=SecretPassword
+# MINIO_SERVER_URL="https://minio.example:9000"
+```
+
+```bash
+# 6. Запуск
+sudo systemctl daemon-reload
+sudo systemctl enable minio.service
+sudo systemctl start minio.service
+sudo systemctl status minio.service
+journalctl -f -u minio.service
+
+# 7. Создать alias
+/usr/local/bin/mc alias set minio http://minio.your_domain:9000 elma365user SecretPassword
+
+# 8. Создать бакет (имя должно начинаться с s3elma365)
+mc mb minio/s3elma365
+
+# 9. CORS — настраивается через веб-интерфейс MinIO или mc
+```
+
+### Подключение MinIO в values-elma365.yaml
+
+```yaml
+db:
+  s3:
+    method: "path"
+    accesskeyid: "elma365user"
+    secretaccesskey: "SecretPassword"
+    bucket: "s3elma365"
+    backend:
+      address: "http://minio.your_domain:9000"
+      region: "ru-central-1"
+    ssl:
+      enabled: false
+```
+
+### TLS/SSL для MinIO
+
+Положить в `/etc/minio/certs/`:
+- `public.crt` — сертификат сервера
+- `private.key` — закрытый ключ
+- `CAs/` — корневой CA при самоподписанном
+
+---
+
+## MongoDB кластер (внешний)
+
+### Установка MongoDB 6.0 на Ubuntu 22.04
+
+```bash
+# На каждой ноде (минимум 3)
+sudo apt-get install gnupg
+curl -fsSL https://pgp.mongodb.com/server-6.0.asc | sudo gpg -o /usr/share/keyrings/mongodb-server-6.0.gpg --dearmor
+echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-6.0.gpg ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/6.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-6.0.list
+sudo apt-get update
+sudo apt install mongodb-org
+sudo systemctl enable --now mongod
+```
+
+### Настройка (на mongodb-server1)
+
+```bash
+mongosh
+use elma365
+db.createUser({user:'elma365', pwd:'SecretPassword', roles:[{role:"readWrite", db:"elma365"},{"role":"root","db":"admin"}]})
+use admin
+db.createUser({user:'superuser', pwd:'SecretPassword', roles: ["root"]})
+exit
+```
+
+### `/etc/mongod.conf` на каждой ноде
+
+```yaml
+net:
+  port: 27017
+  bindIp: 0.0.0.0
+
+replication:
+  replSetName: "rs0"
+  enableMajorityReadConcern: true
+```
+
+```bash
+sudo systemctl restart mongod
+```
+
+### Инициализация реплики (на mongodb-server1)
+
+```bash
+sudo mongosh -u superuser admin
+rs.initiate({
+  _id: "rs0",
+  members: [
+    { _id: 0, host: "mongodb-server1.your_domain" },
+    { _id: 1, host: "mongodb-server2.your_domain" },
+    { _id: 2, host: "mongodb-server3.your_domain" }
+  ]
+})
+rs.conf()
+```
+
+### Безопасность MongoDB
+
+```bash
+openssl rand -base64 756 > /var/lib/mongodb/keyfile
+chmod 400 /var/lib/mongodb/keyfile
+chown mongodb:mongodb /var/lib/mongodb/keyfile
+# Скопировать на все ноды с теми же правами
+```
+
+`/etc/mongod.conf` добавить:
+```yaml
+setParameter:
+  enableLocalhostAuthBypass: false
+security:
+  authorization: "enabled"
+  keyFile: /var/lib/mongodb/keyfile
+```
+
+### Строка подключения MongoDB
+
+```
+mongodb://elma365:SecretPassword@mongodb-server1.your_domain:27017,mongodb-server2.your_domain:27017,mongodb-server3.your_domain:27017/elma365?replicaSet=rs0&readPreference=nearest&maxStalenessSeconds=120
+```
+
+### TLS/SSL для MongoDB
+
+```yaml
+net:
+  tls:
+    mode: requireTLS
+    certificateKeyFile: /path/to/mongodb.pem  # cat key > pem; cat fullchain >> pem
+```
+
+---
+
+## RabbitMQ кластер (внешний)
+
+> ⚠️ **RabbitMQ 4.0 не поддерживается.** Использовать 3.9.15–3.13.
+
+### Установка RabbitMQ 3.12.0 + Erlang 25.3.2.2 на Ubuntu 20.04/22.04
+
+```bash
+# Ключи и репозиторий (упрощённо)
+sudo apt-get install curl gnupg apt-transport-https -y
+# Добавить ключи и репозитории (см. официальную документацию)
+
+sudo apt-get update -y
+
+# Erlang
+sudo apt-get install -y \
+  erlang-base=1:25.3.2.2-1 erlang-asn1=1:25.3.2.2-1 erlang-crypto=1:25.3.2.2-1 \
+  erlang-eldap=1:25.3.2.2-1 erlang-ssl=1:25.3.2.2-1 erlang-mnesia=1:25.3.2.2-1 \
+  erlang-os-mon=1:25.3.2.2-1 erlang-tools=1:25.3.2.2-1
+
+# RabbitMQ
+sudo apt-get install rabbitmq-server=3.12.0-1 -y --fix-missing
+sudo systemctl enable --now rabbitmq-server
+```
+
+### Кластеризация
+
+```bash
+# На каждой ноде создать /etc/rabbitmq/rabbitmq-env.conf:
+RABBITMQ_NODENAME=rabbit@rabbitmq-server1.your_domain
+RABBITMQ_USE_LONGNAME=true
+
+# Скопировать /var/lib/rabbitmq/.erlang.cookie с server1 на все остальные (одинаковый!)
+sudo systemctl restart rabbitmq-server
+
+# На server2 и server3:
+sudo rabbitmqctl stop_app
+sudo rabbitmqctl reset
+sudo rabbitmqctl join_cluster rabbit@rabbitmq-server1.your_domain
+sudo rabbitmqctl start_app
+sudo rabbitmqctl cluster_status
+```
+
+### Настройка пользователя и vhost (на server1)
+
+```bash
+sudo rabbitmq-plugins enable rabbitmq_management
+sudo rabbitmqctl add_vhost elma365vhost
+sudo rabbitmqctl add_user elma365user SecretPassword
+sudo rabbitmqctl set_permissions -p elma365vhost elma365user ".*" ".*" ".*"
+sudo rabbitmqctl set_user_tags elma365user administrator
+
+# Политика HA (зеркалирование)
+sudo rabbitmqctl set_policy -p 'elma365vhost' MirrorAllQueues ".*" '{"ha-mode":"all"}'
+# Или Quorum если HA не поддерживается:
+# rabbitmqctl set_policy –p 'elma365vhost' QuorumDefault "^.*" '{"queue-type":"quorum"}' --priority 0 --apply-to queues
+```
+
+### Строка подключения RabbitMQ
+
+```
+amqp://elma365user:SecretPassword@haproxy-host:5672/elma365vhost
+```
+
+---
+
+## Redis / Valkey кластер (внешний)
+
+> ⚠️ Redis меняет лицензию — рекомендуется Valkey как альтернатива (см. статью о Valkey cluster).
+
+### Установка Redis 6.2.12 на Ubuntu 20.04/22.04
+
+```bash
+sudo apt install lsb-release curl gpg
+curl -fsSL https://packages.redis.io/gpg | sudo gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/redis.list
+sudo apt-get update
+sudo apt-get -y install redis=6:6.2.12-1rl1~$(lsb_release -cs)1 redis-server=6:6.2.12-1rl1~$(lsb_release -cs)1 redis-tools=6:6.2.12-1rl1~$(lsb_release -cs)1 redis-sentinel=6:6.2.12-1rl1~$(lsb_release -cs)1
+```
+
+### `/etc/redis/redis.conf` на каждой ноде
+
+```ini
+bind 0.0.0.0
+maxclients 20000
+maxmemory-policy allkeys-lfu
+save ""
+appendonly no
+masterauth SecretPassword
+requirepass SecretPassword
+# На каждой ноде указать свой FQDN:
+replica-announce-ip redis-server1.your_domain
+# На server2 и server3 добавить:
+replicaof redis-server1.your_domain 6379
+```
+
+```bash
+sudo systemctl restart redis-server
+sudo systemctl enable redis-server
+# Проверка на мастере:
+sudo redis-cli -a SecretPassword info replication
+```
+
+### `/etc/redis/sentinel.conf` на каждой ноде
+
+```ini
+bind 0.0.0.0
+sentinel announce-ip redis-server1.your_domain  # свой FQDN
+sentinel monitor mymaster redis-server1.your_domain 6379 2
+sentinel auth-pass mymaster SecretPassword
+sentinel down-after-milliseconds mymaster 3000
+sentinel failover-timeout mymaster 6000
+sentinel resolve-hostnames yes
+sentinel announce-hostnames yes
+user default on >SecretPassword sanitize-payload ~* &* +@all
+```
+
+```bash
+sudo systemctl restart redis-sentinel
+sudo systemctl enable redis-sentinel
+sudo redis-cli -p 26379 info sentinel
+```
+
+### Строка подключения Redis (Sentinel)
+
+```
+redis-sentinel://SecretPassword@redis-server1.your_domain:26379,redis-server2.your_domain:26379,redis-server3.your_domain:26379?sentinelMasterId=mymaster
+```
+
+Или для Standalone (не Sentinel):
+```
+redis://:SecretPassword@redis-server1.your_domain:6379
+```
+
+---
+
+## PostgreSQL — внешний (standalone для Standard KinD / PROD)
+
+### Установка PostgreSQL 18 на Ubuntu 24.04
+
+```bash
+sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+sudo apt update
+sudo apt install postgresql-18
+```
+
+### Настройка
+
+```bash
+# Создать роль и БД
+sudo -u postgres psql -c "CREATE ROLE elma365 WITH login password 'SecretPassword';"
+sudo -u postgres psql -c "CREATE DATABASE elma365 WITH OWNER elma365;"
+
+# Расширения
+sudo -u postgres psql -d elma365 -c "CREATE EXTENSION \"uuid-ossp\"; CREATE EXTENSION pg_trgm;"
+```
+
+**`/etc/postgresql/18/main/postgresql.conf`:**
+```ini
+listen_addresses = 'localhost, 192.168.10.10'
+max_connections = 2000
+max_locks_per_transaction = 512
+standard_conforming_strings = on
+timezone = 'UTC'
+```
+
+**`/etc/postgresql/18/main/pg_hba.conf` — в конце:**
+```
+host    all             all             192.168.0.0/16              md5
+```
+
+```bash
+sudo systemctl restart postgresql
+```
+
+### TLS/SSL для PostgreSQL
+
+```ini
+ssl = on
+ssl_ca_file = '/etc/ssl/certs/CA.pem'
+ssl_cert_file = '/etc/ssl/certs/ssl-cert.pem'
+ssl_key_file = '/etc/ssl/private/server.key'
+```
+
+### Строка подключения PostgreSQL
+
+```
+postgresql://elma365:SecretPassword@<postgresql-server>:5432/elma365?sslmode=disable
+# С TLS:
+postgresql://elma365:SecretPassword@<postgresql-server>:5432/elma365?sslmode=require
+# Через PGBouncer (порт 6432):
+postgresql://elma365:SecretPassword@<postgresql-server>:6432/elma365?sslmode=disable
+```
+
+### Создание БД с локалью ru_RU.UTF-8 (опционально)
+
+```bash
+sudo locale-gen ru_RU.UTF-8 && sudo update-locale
+sudo systemctl restart postgresql
+sudo -u postgres psql -c "CREATE DATABASE elma365 WITH OWNER = elma365
+  LOCALE_PROVIDER = icu ICU_LOCALE = 'ru-RU' ENCODING = 'UTF8'
+  LC_COLLATE = 'ru_RU.UTF-8' LC_CTYPE = 'ru_RU.UTF-8' TEMPLATE = template0;"
+```
+
+---
+
+## Лицензирование
+
+### Типы лицензий
+
+| Тип | Описание |
+|---|---|
+| **Именная** | Привязана к конкретному пользователю. 1 лицензия = 1 аккаунт (занята всегда, даже офлайн) |
+| **Конкурентная** | Не привязана к пользователю. Определяет число одновременных сессий. Удобна для периодических пользователей |
+| **Серверная** | Активирует системное решение для всех пользователей платформы |
+| **Именная внешних пользователей** | Для портала — одна лицензия = одна учётная запись внешнего пользователя |
+
+**Standard KinD:** до 200 пользователей  
+**Standard Kubernetes / Enterprise:** без ограничений
+
+### Комбинирование лицензий
+
+Можно смешивать именные и конкурентные. Сотрудники с гарантированным доступом → добавить в группу **Привилегированные пользователи** (получат именные лицензии).
+
+### Управление лицензиями
+
+Администрирование → Управление лицензиями → Лицензия платформы.
+
+Заблокированный пользователь **освобождает** именную лицензию.
+
+Для конкурентных лицензий можно настроить таймаут бездействующей сессии (автоосвобождение).
+
+### Системные решения
+
+- **ECM, Advanced Security Pack** — активируются без лицензии
+- **CRM, Omni, Проекты** — именные / конкурентные лицензии
+- **Полнотекстовый поиск** — серверная лицензия
+- **ELMA Bot** — серверная лицензия, приобретается отдельно
+
+---
+
+## Изменение параметров после установки
+
+### ELMA365 Standard KinD — через `config-elma365.txt`
+
+Файл создаётся при первом запуске установочного скрипта. После изменений — применять:
+
+```bash
+sudo ./elma365-docker.sh --upgrade
+```
+
+**Основные параметры config-elma365.txt:**
+
+| Параметр | Описание |
+|---|---|
+| `ELMA365_HOST` | IP или FQDN (в DNS нужна A-запись) |
+| `ELMA365_EMAIL` | Email супервизора (только при первой установке) |
+| `ELMA365_PASSWORD` | Пароль супервизора |
+| `ELMA365_LANGUAGE` | Язык: `ru-RU`, `en-US`, `sk-SK` |
+| `ELMA365_EDITION` | `standard` или `enterprise` |
+| `ELMA365_DB_PSQL` | Строка подключения к PostgreSQL |
+| `ELMA365_DB_PSQL_RO` | Строка подключения к PostgreSQL (только чтение) |
+| `ELMA365_DB_MONGO` | Строка подключения к MongoDB |
+| `ELMA365_DB_S3_ADDRESS` | Адрес MinIO/S3 |
+| `ELMA365_DB_S3_BUCKET` | Имя бакета (формат `s3elma365*`) |
+| `ELMA365_DB_S3_USER` | Пользователь S3 |
+| `ELMA365_DB_S3_PASSWORD` | Пароль S3 |
+
+**SMTP-параметры:**
+
+| Параметр | Описание |
+|---|---|
+| `ELMA365_SMTP_HOST` | IP/URL SMTP-сервера |
+| `ELMA365_SMTP_PORT` | Порт SMTP |
+| `ELMA365_SMTP_FROM` | Email отправителя |
+| `ELMA365_SMTP_USER` | Логин SMTP |
+| `ELMA365_SMTP_PASSWORD` | Пароль SMTP |
+| `ELMA365_SMTP_TLS` | `false` (если используется ELMA365_MAILER_SMTPTLS) |
+| `ELMA365_MAILER_SMTPTLS` | С версии 2025.10.12: `notls`, `tls`, `starttls` |
+
+**TLS/HTTPS-параметры:**
+
+| Параметр | Описание |
+|---|---|
+| `ELMA365_TLS_CRT` | Путь к fullchain SSL-сертификату |
+| `ELMA365_TLS_KEY` | Путь к закрытому ключу |
+| `ELMA365_TLS_CA` | Путь к корневому CA (для самоподписанных) |
+| `ELMA365_CERTMANAGER` | `true` — автоматический Let's Encrypt (нужен порт 80) |
+| `ELMA365_CERTMANAGER_SELFSIGNED` | `true` — самоподписанный через cert-manager |
+
+> ⚠️ Параметры TLS игнорируются если в `ELMA365_HOST` указан IP-адрес.
+
+### ELMA365 Enterprise/Standard Kubernetes — через values-elma365.yaml + helm upgrade
+
+```bash
+helm upgrade --install elma365 elma365/elma365 \
+  -f values-elma365.yaml \
+  --timeout=30m \
+  --wait \
+  [-n namespace]
+```
+
+---
+
+## Офлайн установка (air-gap)
+
+### ELMA365 Standard KinD — офлайн
+
+```bash
+# 1. На машине с интернетом:
+sudo curl -fsSL -o elma365-docker.sh https://dl.elma365.com/onPremise/latest/elma365-docker-offline-latest
+chmod +x elma365-docker.sh
+./elma365-docker.sh   # скачивает ~4-5 ГБ в каталог elma365-X.Y.Z
+
+# 2. Скопировать каталог elma365-X.Y.Z на изолированный сервер
+
+# 3. На изолированном сервере установить Docker (KinD не поддерживает Cgroups v2!)
+
+# 4. Создать конфиг (первый запуск):
+sudo ./elma365-docker.sh --offline
+# Заполнить config-elma365.txt
+
+# 5. Запустить установку
+sudo ./elma365-docker.sh --offline
+```
+
+> ⚠️ KinD не поддерживает Cgroups v2. При проблемах смотреть документацию KinD known-issues.
+
+### ELMA365 Enterprise/Standard Kubernetes — офлайн (Harbor + скрипт)
+
+**Шаг 1. Создать проект в Harbor (Projects → +New project, например `images`)**
+
+**Шаг 2. Скачать образы на машине с интернетом:**
+
+```bash
+curl -fsSL -o elma365-charts-offline.sh https://dl.elma365.com/onPremise/latest/elma365-charts-offline-latest
+chmod +x elma365-charts-offline.sh
+
+# Интерактивно (выбрать pull + пакеты):
+./elma365-charts-offline.sh
+
+# Или скачать всё:
+./elma365-charts-offline.sh --pull
+
+# Скопировать каталог elma365-X.Y.Z на изолированный сервер
+```
+
+**Шаг 3. Загрузить образы в Harbor:**
+
+```bash
+cd elma365-X.Y.Z
+./elma365-charts-offline.sh  # выбрать push + нужные пакеты
+# Или неинтерактивно:
+./elma365-charts-offline.sh --push
+```
+
+**Ссылки для офлайн-скриптов:**
+```
+# Latest офлайн
+https://dl.elma365.com/onPremise/latest/elma365-charts-offline-latest
+https://dl.elma365.com/onPremise/latest/elma365-docker-offline-latest
+
+# Конкретная версия
+https://dl.elma365.com/onPremise/2026/1/12/elma365-charts-offline-2026.1.12
+```
+
+---
+
+## Deckhouse-специфика (air-gap кластер)
+
+Deckhouse — рекомендуемая платформа k8s для ELMA365. Включена в реестр российского ПО, сертифицирована CNCF.
+
+### Требования для установки
+
+**Персональный компьютер (инсталлятор):**
+- ОС: Windows 10+, macOS 10.15+, Ubuntu 18.04+, Fedora 35+
+- Установленный Docker
+- SSH-доступ по ключу к master-узлу
+
+> ⚠️ Нельзя запускать инсталлятор на том же узле, где будет master! Docker не должен быть установлен на master-узле до установки Deckhouse.
+
+**Master-узел:**
+- ≥ 12 CPU, ≥ 16 GB RAM, ≥ 200 GB диск
+- Поддерживаемая ОС
+- Доступ к registry (через прокси или локальный Harbor)
+- Без установленного container runtime (containerd, docker)
+
+### Этапы установки
+
+1. Скачать образы Deckhouse → загрузить в локальный реестр (Harbor)
+2. Сгенерировать `config.yml` через сервис [Быстрый старт Deckhouse](https://deckhouse.ru/gs/)
+3. Запустить инсталлятор Deckhouse в Docker с персонального компьютера
+
+### Пример `config.yml` (статический кластер, интернет)
+
+```yaml
+apiVersion: deckhouse.io/v1
+kind: ClusterConfiguration
+clusterType: Static
+podSubnetCIDR: 10.111.0.0/16
+serviceSubnetCIDR: 10.222.0.0/16
+kubernetesVersion: "Automatic"
+clusterDomain: "cluster.local"
+---
+apiVersion: deckhouse.io/v1
+kind: InitConfiguration
+deckhouse:
+  imagesRepo: registry.deckhouse.ru/deckhouse/ce
+  registryDockerCfg: eyJhdXRocyI6...
+---
+apiVersion: deckhouse.io/v1alpha1
+kind: ModuleConfig
+metadata:
+  name: global
+spec:
+  version: 2
+  settings:
+    modules:
+      publicDomainTemplate: "%s.elewise.local"
+---
+apiVersion: deckhouse.io/v1alpha1
+kind: ModuleConfig
+metadata:
+  name: cni-cilium
+spec:
+  version: 1
+  enabled: true
+  settings:
+    tunnelMode: VXLAN
+```
+
+### Ключевые параметры конфига
+
+- `podSubnetCIDR` — сеть подов
+- `serviceSubnetCIDR` — сеть сервисов
+- `kubernetesVersion` — версия k8s (`"Automatic"` = последняя в канале)
+- `releaseChannel` — канал обновлений (`EarlyAccess` рекомендуется)
+- `publicDomainTemplate` — шаблон для системных доменов (Grafana, etc.)
+- `podNetworkMode` — режим flannel: `VXLAN` (L3) или `HostGW` (L2)
+- `internalNetworkCIDRs` — внутренняя сеть узлов кластера
+
+---
+
+## ELMA Bot
+
+ELMA Bot — low-code конструктор чат-ботов на ML. Работает с ELMA365 CRM и ELMA365 Omni.
+
+**Режимы работы:**
+- **Чат-бот** — ведёт диалог вместо оператора
+- **Суфлёр** — подсказывает ответы оператору в реальном времени
+
+**Особенности:**
+- ML-обучение автоматически запускается при изменении сценариев и триггеров
+- Логика — сценарии + база знаний
+- К одной линии можно подключить только 1 чат-бот и 1 суфлёра
+
+**Лицензирование:** серверная лицензия, покупается отдельно.  
+В On-Premises и SaaS Enterprise — требуется предварительная настройка интеграции.
+
+**Требует:** отдельный компонент Elasticsearch (включить в `elma365-dbs` `values.yaml`:  `elasticsearch.enabled: true`)
+
+---
+
+## Полезные диагностические команды
+
+```bash
+# Helm — статус и история
+helm list [-n namespace]
+helm status elma365 [-n namespace]
+helm history elma365 [-n namespace]
+
+# Посмотреть текущие values
+helm get values elma365 [-n namespace]
+
+# Откат
+helm rollback elma365 [revision] [-n namespace]
+
+# Kubernetes — поды ELMA365
+kubectl get pods [-n namespace]
+kubectl describe pod <pod-name> [-n namespace]
+kubectl logs <pod-name> [-n namespace] --tail=100
+
+# MinIO — проверка
+systemctl status minio.service
+journalctl -u minio.service -n 50
+
+# MongoDB — проверка реплики
+mongosh -u superuser admin
+rs.status()
+
+# RabbitMQ — кластер
+rabbitmqctl cluster_status
+rabbitmqctl list_policies --vhost elma365vhost
+
+# Redis — репликация
+redis-cli -a SecretPassword info replication
+redis-cli -p 26379 info sentinel
+
+# PostgreSQL — подключения
+sudo -u postgres psql -c "SELECT count(*) FROM pg_stat_activity;"
+```
+
