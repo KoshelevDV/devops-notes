@@ -16,6 +16,18 @@
 7. [Офлайн-обновление](#офлайн-обновление)
 8. [Ссылки для скачивания](#ссылки-для-скачивания)
 9. [Базы данных](#базы-данных)
+10. [SSL-сертификаты и TLS](#ssl-сертификаты-и-tls-настройка)
+11. [Настройка системы (prepare)](#настройка-системы-prepare)
+12. [Миграция на другой сервер](#миграция-на-другой-сервер)
+13. [Hot Standby PostgreSQL](#hot-standby-postgresql-катастрофоустойчивость)
+14. [Активация лицензии](#активация-лицензии-on-premises)
+15. [Лицензирование (подробно)](#лицензирование-on-premises-подробно)
+16. [Защита данных](#защита-данных-безопасность)
+17. [Kontur Tunnel](#kontur-tunnel-интеграция-с-контур-уц)
+18. [Air-gap Kubernetes (Harbor)](#air-gap-kubernetes-без-deckhouse-через-harbor)
+19. [Установка Enterprise в k8s (сводная)](#установка-elma365-enterprise-в-kubernetes-сводная)
+20. [Варианты инфраструктуры (расширенная)](#варианты-инфраструктуры-расширенная)
+21. [Подготовка встроенных БД](#подготовка-встроенных-бд-elma365-dbs)
 
 ---
 
@@ -1153,5 +1165,708 @@ redis-cli -p 26379 info sentinel
 
 # PostgreSQL — подключения
 sudo -u postgres psql -c "SELECT count(*) FROM pg_stat_activity;"
+```
+
+
+---
+
+## SSL-сертификаты и TLS настройка
+
+> Источник: https://elma365.com/ru/help/platform/ssl-certificates.html
+
+### Самоподписанные сертификаты через OpenSSL
+
+⚠️ Начиная с Chrome 58 / Firefox 48 требуется атрибут **SAN** (SubjectAltName) — иначе ошибка «соединение не защищено».
+
+```bash
+# 1. Создать корневой CA
+sudo openssl genrsa -des3 -out /etc/ssl/private/rootCA.key 2048
+sudo openssl req -x509 -new -nodes -key /etc/ssl/private/rootCA.key \
+  -sha256 -days 365 -out /etc/ssl/certs/rootCA.pem
+
+# 2. Файл конфигурации SAN — /etc/ssl/v3.ext
+cat > /etc/ssl/v3.ext << 'EOF'
+authorityKeyIdentifier=keyid,issuer
+basicConstraints=CA:FALSE
+keyUsage = digitalSignature, nonRepudiation, keyEncipherment, dataEncipherment
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = mydomain.com
+EOF
+
+# 3. Создать сертификат сервера
+sudo openssl genrsa -out /etc/ssl/private/selfsigned.key 2048
+sudo openssl req -new -key /etc/ssl/private/selfsigned.key \
+  -out /etc/ssl/certs/selfsigned.csr
+sudo openssl x509 -req \
+  -in /etc/ssl/certs/selfsigned.csr \
+  -CA /etc/ssl/certs/rootCA.pem \
+  -CAkey /etc/ssl/private/rootCA.key \
+  -CAcreateserial \
+  -out /etc/ssl/certs/selfsigned.crt \
+  -days 365 -sha256 -extfile /etc/ssl/v3.ext
+```
+
+Результат:
+- `selfsigned.key` — закрытый ключ
+- `selfsigned.crt` — сертификат сервера
+- `rootCA.pem` — корневой CA (нужен при установке ELMA365 и компонентов)
+
+### TLS для ELMA365 Standard KinD (config-elma365.txt)
+
+```ini
+ELMA365_TLS_CRT=/etc/ssl/certs/selfsigned.crt   # fullchain
+ELMA365_TLS_KEY=/etc/ssl/private/selfsigned.key
+ELMA365_TLS_CA=/etc/ssl/certs/rootCA.pem         # при самоподписанном
+# ELMA365_CERTMANAGER=true                       # Let's Encrypt (нужен порт 80)
+# ELMA365_CERTMANAGER_SELFSIGNED=true            # самоподписанный через cert-manager
+```
+
+> ⚠️ TLS-параметры **игнорируются** если в `ELMA365_HOST` указан IP-адрес (только FQDN).
+
+### TLS в values-elma365.yaml (Enterprise/Standard Kubernetes)
+
+```yaml
+tls:
+  enabled: true
+  secretName: elma365-tls   # k8s Secret с cert+key
+```
+
+Создать Secret:
+```bash
+kubectl create secret tls elma365-tls \
+  --cert=selfsigned.crt \
+  --key=selfsigned.key \
+  [-n namespace]
+```
+
+---
+
+## Настройка системы (prepare)
+
+> Источник: https://elma365.com/ru/help/platform/configure-system.html
+
+Выполнять **до установки** на всех узлах.
+
+### Hostname
+
+```bash
+sudo hostnamectl set-hostname server1.your_domain --static
+sudo hostnamectl set-hostname server2.your_domain --static
+sudo hostnamectl set-hostname server3.your_domain --static
+```
+
+### NTP синхронизация
+
+```bash
+# Добавить NTP-серверы (если DHCP не раздаёт)
+sudo echo 'NTP=0.pool.ntp.org 1.pool.ntp.org 2.pool.ntp.org 3.pool.ntp.org' \
+  >> /etc/systemd/timesyncd.conf
+
+sudo systemctl restart systemd-timesyncd
+
+# Статус синхронизации
+sudo timedatectl status
+sudo timedatectl timesync-status
+```
+
+> Несинхронизированное время ломает JWT, TLS, etcd и Patroni — обязательно проверять на всех узлах.
+
+---
+
+## Миграция на другой сервер
+
+> Источник: https://elma365.com/ru/help/platform/migration-to-another-server.html
+
+**Алгоритм:**
+
+1. **Сделать резервную копию** (до начала работ):
+   - Через утилиту `elma365-backupper` — статья «Резервное копирование и восстановление баз данных»
+   - Внешними средствами — статья «Резервное копирование внешними средствами»
+   - Для Standard — статья «Резервное копирование данных ELMA365 Standard»
+
+2. **Установить ELMA365 в новом окружении**:
+   - Enterprise/Standard Kubernetes: по статье «Установка ELMA365 Enterprise в Kubernetes»
+   - Standard KinD: по статье «Установка ELMA365 Standard»
+
+3. **Восстановить данные** из резервной копии в новую инсталляцию.
+
+> ⚠️ Документация не описывает live-миграцию. Рекомендуется плановое окно обслуживания с остановкой сервиса.
+
+---
+
+## Hot Standby PostgreSQL (катастрофоустойчивость)
+
+> Источник: https://elma365.com/ru/help/platform/configure-hot-standby-postgresql.html
+
+Дополнение к основному кластеру PostgreSQL (Patroni+etcd+HAProxy). Standby кластер — **географически удалённый**, реплицируется с основного мастера через HAProxy.
+
+### Архитектура
+
+```
+[Кластер 1 — основной]         [Кластер 2 — Standby]
+postgres-server1 (master)  →   postgres-server4 (Standby Leader)
+postgres-server2 (replica) →   postgres-server5 (cascade replica)
+postgres-server3 (replica) →   postgres-server6 (cascade replica)
+         ↑                              ↑
+    haproxy:5000                  haproxy:5000
+    (postgres_master)         (postgres_master)
+```
+
+### Шаг 1. PostgreSQL — разрешить соединения между кластерами
+
+Добавить в `pg_hba.conf` на всех узлах обоих кластеров:
+```
+# Cluster 1 hosts
+host replication replicator 192.168.1.1/32 md5
+host replication replicator 192.168.1.2/32 md5
+host replication replicator 192.168.1.3/32 md5
+# Standby Cluster 2 hosts
+host replication replicator 192.168.2.1/32 md5
+host replication replicator 192.168.2.2/32 md5
+host replication replicator 192.168.2.3/32 md5
+```
+
+```bash
+systemctl restart postgresql
+```
+
+### Шаг 2. Patroni — настройка Standby кластера
+
+В `/etc/patroni/config.yml` на узлах Standby кластера:
+
+```yaml
+scope: postgres-cluster2      # уникальное имя (≠ основному)
+name: postgresql-server4      # уникальное имя узла
+
+bootstrap:
+  dcs:
+    standby_cluster:
+      host: haproxy-server.your_domain   # мастер основного кластера
+      port: 5000
+      create_replica_methods:
+      - basebackup
+
+pg_hba:
+  - host all all 0.0.0.0/0 md5
+  - host replication replicator localhost trust
+  # Оба кластера:
+  - host replication replicator 192.168.1.1/32 md5
+  - host replication replicator 192.168.1.2/32 md5
+  - host replication replicator 192.168.1.3/32 md5
+  - host replication replicator 192.168.2.1/32 md5
+  - host replication replicator 192.168.2.2/32 md5
+  - host replication replicator 192.168.2.3/32 md5
+```
+
+```bash
+# Если Patroni уже запущен — пересоздать
+sudo systemctl stop patroni
+sudo rm -rf /var/lib/postgresql/10/main
+sudo etcdctl rm --recursive /service/postgres-cluster2
+sudo systemctl restart patroni
+
+# Проверить (роль лидера — "Standby Leader"):
+patronictl -c /etc/patroni/config.yml list
+```
+
+### Шаг 3. HAProxy — добавить серверы Standby кластера
+
+```ini
+listen postgres_master
+    bind haproxy-server.your_domain:5000
+    option httpchk OPTIONS /master
+    http-check expect status 200
+    server postgres-server1 postgres-server1.your_domain:5432 check port 8008
+    server postgres-server2 postgres-server2.your_domain:5432 check port 8008
+    server postgres-server3 postgres-server3.your_domain:5432 check port 8008
+    server postgres-server4 postgres-server4.your_domain:5432 check port 8008
+    server postgres-server5 postgres-server5.your_domain:5432 check port 8008
+    server postgres-server6 postgres-server6.your_domain:5432 check port 8008
+```
+
+### Переключение (failover на Standby)
+
+```bash
+# При недоступности основного — убрать standby_cluster из patroni:
+patronictl edit-config --force \
+  -s standby_cluster.host='' \
+  -s standby_cluster.port='' \
+  -s standby_cluster.create_replica_methods=''
+
+# При восстановлении основного — вернуть его в Standby-режим:
+patronictl edit-config --force \
+  -s standby_cluster.host=haproxy-server.your_domain \
+  -s standby_cluster.port=5000 \
+  -s standby_cluster.create_replica_methods='- basebackup'
+```
+
+> ⚠️ Не допускать работы двух мастеров одновременно (split-brain)!
+
+---
+
+## Активация лицензии On-Premises
+
+> Источник: https://elma365.com/ru/help/platform/activate_on_premise.html
+
+После установки — активация выполняется **одинаково для Standard и Enterprise**:
+
+1. Авторизоваться в системе → откроется окно активации.
+2. **Триал (2 недели бесплатно):** заполнить форму, нажать «Попробовать».
+3. **Активация через менеджера:**
+   - Скопировать **Регистрационный ключ сервера** → передать менеджеру ELMA365.
+   - Получить ключ активации (триальный — до 1 месяца; коммерческий — бессрочный).
+   - Вставить ключ в поле «Ключ активации» → нажать «Активировать».
+
+> Любой ключ активации действителен **14 дней** с момента генерации.
+
+**Повторная активация:**
+- После изменения настроек подключения к PostgreSQL для редакции Enterprise может потребоваться повторная активация.
+- Уведомление появится в разделе «Администрирование».
+- Срок на повторную активацию — **7 дней** (затем компания замораживается).
+
+---
+
+## Лицензирование On-Premises (подробно)
+
+> Источники: licences.html, licenses-on-premises.html, active_licences.html, licensing-elma365.html
+
+### Подсчёт лицензий
+
+- **Именная лицензия** — занята конкретным пользователем **всегда** (даже офлайн).
+  - Освобождается при блокировке учётной записи.
+- **Конкурентная лицензия** — занята только при активной сессии.
+  - Настраивается таймаут бездействия (мин.) — сессия завершается принудительно.
+  - Учитывается активность на всех устройствах.
+  - Для полного освобождения — закрыть все вкладки и мобильное приложение.
+- **Именная внешних пользователей** — для внешнего портала.
+- **Серверная** — активирует решение для всех без счётчика пользователей.
+
+### Управление (Администрирование → Управление лицензиями)
+
+- Просмотр количества свободных/занятых лицензий по типам.
+- Настройка **Привилегированных пользователей** (занимают именные лицензии при миксе).
+- Настройка таймаута конкурентной сессии.
+- Просмотр свободного места в S3.
+- Связь с менеджером для изменения числа лицензий.
+
+```
+Путь: Администрирование → Управление лицензиями → ⚙️ (шестерёнка)
+```
+
+### Комбинация именных + конкурентных
+
+1. Настроить список «Привилегированных пользователей» (≤ кол-ва именных лицензий).
+2. Остальные пользователи → конкурентные лицензии.
+3. Также через: Администрирование → Группы → Системные группы → «Привилегированные пользователи».
+
+### Active Users (Администрирование → Активные пользователи)
+
+Показывает всех работающих сотрудников независимо от типа лицензии.
+
+---
+
+## Защита данных (безопасность)
+
+> Источник: https://elma365.com/ru/help/platform/data-protection.html
+
+### Внутренняя безопасность ELMA365
+
+| Аспект | Реализация |
+|---|---|
+| Аутентификация | JWT-токены |
+| Авторизация | RBAC, проверка на сервере |
+| Связь между сервисами | gRPC + HTTP внутри k8s кластера |
+| Внешний доступ | ingress-правила, HTTP/WebSocket |
+| Шифрование S3 | Алгоритмы шифрования + цифровая подпись, ограниченное время жизни |
+
+### Рекомендации по безопасности для Enterprise
+
+| Компонент | Рекомендация |
+|---|---|
+| PostgreSQL | Выносить на выделенные серверы, администрировать отдельно |
+| MongoDB | Выносить в отдельный кластер |
+| MinIO S3 | Отдельный кластер, совместимый с S3-протоколом |
+| ОС / гипервизор | Ответственность клиента, вне контура безопасности ELMA365 |
+
+### Что НЕ входит в контур безопасности ELMA365 On-Premises
+
+- Безопасность ОС узлов
+- Настройка провайдера виртуализации / физических серверов
+- Сетевая безопасность периметра
+
+**Документация PostgreSQL для изучения:**
+- Администрирование сервера: https://postgrespro.ru/docs/postgresql/10/admin
+- Аутентификация клиентов: https://postgrespro.ru/docs/postgresql/10/client-authentication
+- Роли БД: https://postgrespro.ru/docs/postgresql/10/user-manag
+
+---
+
+## Kontur Tunnel (интеграция с Контур УЦ)
+
+> Источник: https://elma365.com/ru/help/platform/install-kontur-tunnel.html
+
+Нужен для модуля подписания сертификатов через Контур УЦ. Требует отдельную ВМ на Ubuntu 18.04–22.04.
+
+### 1. Установить CryptoPro
+
+```bash
+# Скачать дистрибутив с cryptopro.ru
+tar -zxvf linux-amd64_deb.tgz
+cd linux-amd64_deb/
+./install.sh
+```
+
+### 2. Установить корневые сертификаты Контур УЦ
+
+```bash
+# Скачать с https://ca.kontur.ru/about/certificates
+/opt/cprocsp/bin/amd64/certmgr -inst -file <путь/к/cert.cer> -store uROOT
+```
+
+### 3. Сгенерировать запрос на сертификат
+
+```bash
+/opt/cprocsp/bin/amd64/cryptcp -creatrqst <запрос.csr> \
+  -provtype 80 \
+  -cont "\\\\.\\HDIMAGE\\<имя_контейнера>" \
+  -certusage "1.3.6.1.5.5.7.3.2" \
+  -dn "E=admin@company.ru, C=RU, S=Регион, L=Город, O=ООО Название, \
+       OID.1.2.643.3.131.1.1=ИНН, OID.1.2.643.100.1=ОГРН, \
+       STREET=Юр.адрес, CN=domain.ru" \
+  -ex -k
+# Отправить .csr на: cabuc-help@skbkontur.ru
+```
+
+### 4. Установить полученный сертификат
+
+```bash
+/opt/cprocsp/bin/amd64/csptestf -keys \
+  -cont '\\.\\HDIMAGE\\<имя_контейнера>' \
+  -keyt exchange \
+  -impcert /path/to/received.cer
+
+/opt/cprocsp/bin/amd64/csptestf -absorb -certs -autoprov
+```
+
+### 5. Установить и настроить stunnel-msspi
+
+```bash
+wget https://github.com/CryptoPro/stunnel-msspi/releases/download/stunnel-5.65-cpro-0.55/stunnel-5.65-cpro-0.55-amd64-ubuntu.tar.gz
+tar -zxvf stunnel-5.65-cpro-0.55-amd64-ubuntu.tar.gz
+mv stunnel-msspi /opt/cprocsp/bin/amd64/
+
+mkdir -p /etc/stunnel/
+```
+
+`/etc/stunnel/stunnel.conf`:
+```ini
+output = /var/log/stun.log
+socket = l:TCP_NODELAY=1
+socket = r:TCP_NODELAY=1
+debug = 7
+
+[https]
+connect = cloud.kontur-ca.ru:443
+client = yes
+accept = <ip_туннеля>:8200
+cert = <SHA1_отпечаток_сертификата>
+verify = 2
+```
+
+```bash
+# Отпечаток сертификата:
+/opt/cprocsp/bin/amd64/certmgr -list -store umy
+
+# Запустить туннель:
+/opt/cprocsp/bin/amd64/stunnel-msspi /etc/stunnel/stunnel.conf
+```
+
+### 6. Настроить nginx как прокси
+
+```bash
+apt install nginx
+```
+
+`/etc/nginx/conf.d/crypto.conf`:
+```nginx
+server {
+    listen <ip_туннеля>:443;
+    access_log /var/log/nginx/crypto.log;
+    error_log /var/log/nginx/crypto.log;
+
+    location / {
+        proxy_pass http://<ip_туннеля>:8200;
+        proxy_set_header Host cloud.kontur-ca.ru;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
+```
+
+```bash
+systemctl restart nginx
+
+# Проверка:
+curl http://<ip_туннеля>:443/v3/Hello
+# Ожидается: "Hello, this is Crypt front API v3"
+```
+
+> Если ошибка — обратиться в поддержку Контур УЦ для добавления IP в whitelist.
+
+---
+
+## Air-gap Kubernetes (без Deckhouse, через Harbor)
+
+> Источник: https://elma365.com/ru/help/platform/kubernetes-air-gap.html  
+> ⚠️ Статья помечена как **устаревшая**. Актуальный способ — через скрипт `elma365-charts-offline.sh`.
+
+### Установка Harbor (локальный registry)
+
+```bash
+# На машине с интернетом — скачать Harbor offline installer
+wget https://github.com/goharbor/harbor/releases/download/vX.Y.Z/harbor-offline-installer-vX.Y.Z.tgz
+tar xzvf harbor-offline-installer-vX.Y.Z.tgz
+cd harbor
+
+cp harbor.yml.tmpl harbor.yml
+# Отредактировать: hostname, порты HTTP/HTTPS, пароль admin, data_volume
+
+# Установить docker и docker-compose (если не установлены)
+sudo ./install.sh
+
+# Открыть https://registry.example.com:443 (admin / пароль из harbor.yml)
+# Создать проект: Projects → +New project → "images" (Public)
+```
+
+### Загрузка образов ELMA365 в Harbor
+
+```bash
+# На машине с интернетом:
+curl -fsSL -o elma365-charts-offline.sh \
+  https://dl.elma365.com/onPremise/latest/elma365-charts-offline-latest
+chmod +x elma365-charts-offline.sh
+./elma365-charts-offline.sh --pull     # ~5 ГБ, каталог elma365-X.Y.Z
+
+# Скопировать elma365-X.Y.Z на сервер установки
+
+# На сервере — загрузить в Harbor:
+cd elma365-X.Y.Z
+./elma365-charts-offline.sh --push \
+  --uri registry.example.com:443/images/elma365 \
+  --creds admin:Harbor12345
+```
+
+### Настройка values для elma365-dbs (air-gap)
+
+```yaml
+# В values-dbs.yaml для каждой БД:
+image:
+  registry: registry.example.com:443/images/elma365
+  pullSecrets:
+    - myRegistryKeySecretName
+```
+
+### Настройка values для elma365 (air-gap)
+
+```yaml
+image:
+  registry: registry.example.com:443/images/elma365
+  dockerRegistry: registry.example.com
+  pullSecret:
+    - myRegistryKeySecretName
+```
+
+---
+
+## Установка ELMA365 Enterprise в Kubernetes (сводная)
+
+> Источник: https://elma365.com/ru/help/platform/installing-elma365-enterprise.html
+
+Установка состоит из **5 этапов**:
+
+1. **Подготовка инфраструктуры** (опционально — если нет готовых БД)
+2. **Скачивание Helm-чарта** и конфигурационного файла
+3. **Заполнение** `values-elma365.yaml`
+4. **Установка** через `helm upgrade --install`
+5. **Установка дополнений** (опционально — Р7-Офис, ELMA Bot и т.д.)
+
+### Требования к Kubernetes-кластеру
+
+- ingress-nginx контроллер
+- coredns
+- RBAC
+- StorageClass
+- Поддерживаемые версии: см. в системных требованиях
+- Разрешено проксирование из подов во внешнюю сеть
+
+### Получение values-elma365.yaml (онлайн)
+
+```bash
+helm repo add elma365 https://charts.elma365.tech
+helm repo update
+
+# latest
+helm show values elma365/elma365 > values-elma365.yaml
+
+# конкретная версия
+helm show values elma365/elma365 --version 2026.1.12 > values-elma365.yaml
+```
+
+### Получение values-elma365.yaml (офлайн)
+
+```bash
+# На машине с интернетом:
+helm repo add elma365 https://charts.elma365.tech
+helm pull elma365/elma365    # скачать elma365-X.Y.Z.tgz
+
+# Скопировать на сервер, распаковать:
+tar -xf elma365-X.Y.Z.tgz
+cp elma365/values.yaml values-elma365.yaml
+```
+
+### Ключевые параметры values-elma365.yaml
+
+```yaml
+global:
+  host: 'elma365.company.ru'   # FQDN или IP
+  edition: 'standard'           # или 'enterprise'
+  ingress:
+    hostEnabled: true           # если используется FQDN
+
+bootstrapCompany:
+  email: 'admin@company.ru'
+  password: 'Pass-123'          # допустимо: A-Za-z0-9 - _ .
+  locale: 'ru-RU'
+
+language:
+  default: 'ru-RU'              # ru-RU, en-US, sk-SK
+
+db:
+  psqlUrl: 'postgres://...'
+  mongoUrl: 'mongodb://...'
+  vahterMongoUrl: 'mongodb://...'
+  redisUrl: 'redis://...'
+  amqpUrl: 'amqp://...'
+  s3:
+    method: 'path'
+    ...
+```
+
+> ⚠️ Логин главного администратора (email) **нельзя изменить после установки**.
+
+### Установка
+
+```bash
+helm upgrade --install elma365 elma365/elma365 \
+  -f values-elma365.yaml \
+  --timeout=30m \
+  --wait \
+  [-n namespace]
+```
+
+---
+
+## Варианты инфраструктуры (расширенная)
+
+> Источник: https://elma365.com/ru/help/platform/infrastructure-preparation.html
+
+| Тип окружения | Серверов | Компоненты |
+|---|---|---|
+| Ознакомление (интернет) | 1 ВМ | Встроенные БД |
+| Ознакомление (офлайн) | 1 ВМ | Встроенные БД, локальный registry |
+| Ознакомление + внешние БД | 1+2 ВМ | Внешние PostgreSQL + MinIO |
+| DEV/TEST (интернет) | 1 ВМ | Встроенные БД |
+| DEV/TEST (офлайн) | 1 + 1 (registry) ВМ | Встроенные БД + Harbor |
+| PROD (интернет) | 1 + 3 ВМ для БД | Внешние MongoDB, PostgreSQL, MinIO |
+| PROD (офлайн) | 1 + 3 + 1 (registry) ВМ | То же + Harbor |
+| PROD HA (офлайн, Enterprise) | 10 k8s + 10 БД + 2 LB + 2 R7 + 1 registry | Полная отказоустойчивость |
+
+**HA PROD-окружение (минимальная конфигурация):**
+- 10 ВМ для k8s кластера (ELMA365 + встроенные компоненты)
+- 10 ВМ для внешних БД (отказоустойчивые кластеры)
+- 2 ВМ для балансировки/проксирования (HAProxy)
+- 2 ВМ для Р7-Офис
+- 1 ВМ для Harbor (registry образов)
+
+---
+
+## Подготовка встроенных БД (elma365-dbs)
+
+> Источник: https://elma365.com/ru/help/platform/embedded-databases-settings.html
+
+Чарт `elma365-dbs` устанавливает все компоненты в Kubernetes. Можно установить только нужные.
+
+### Команды
+
+```bash
+helm repo add elma365 https://charts.elma365.tech
+helm repo update
+helm show values elma365/elma365-dbs > values-elma365-dbs.yaml
+# Заполнить конфиг
+helm install elma365-dbs elma365/elma365-dbs -f values-elma365-dbs.yaml [-n namespace]
+```
+
+### PostgreSQL — кластеризация в values-elma365-dbs.yaml
+
+```yaml
+postgresql:
+  auth:
+    database: elma365
+    username: postgres
+    postgresPassword: pgpassword
+    replicationUsername: repl_user
+    replicationPassword: repl_password
+  primary:
+    persistence:
+      size: 100Gi
+      enabled: true
+  # Включить для HA:
+  architecture: replication
+  readReplicas:
+    replicaCount: 2
+  replication:
+    synchronousCommit: 'on'
+    numSynchronousReplicas: 1
+```
+
+### MongoDB — кластеризация
+
+```yaml
+mongodb:
+  auth:
+    username: elma365
+    database: elma365
+    password: mongopassword
+    rootPassword: mongorootpassword
+    replicaSetKey: replicapassword
+  persistence:
+    size: 20Gi
+  # Включить для HA:
+  architecture: replicaset
+  replicaCount: 3
+```
+
+### Air-gap: приватный registry в values-elma365-dbs.yaml
+
+```yaml
+postgresql:
+  volumePermissions:
+    enabled: true
+    image:
+      registry: registry.example.com/bitnami-shell
+      pullSecrets:
+        - myRegistryKeySecretName
+  image:
+    registry: registry.example.com/postgresql
+    pullSecrets:
+      - myRegistryKeySecretName
+
+mongodb:
+  image:
+    registry: registry.example.com/mongodb
+    pullSecrets:
+      - myRegistryKeySecretName
 ```
 
