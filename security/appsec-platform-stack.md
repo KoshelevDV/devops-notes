@@ -265,6 +265,116 @@ curl -X POST "http://10.0.30.64/api/v1/scan-results/" \
 
 ---
 
+---
+
+## IaC Security Scanning — Checkov
+
+**Шаблон:** `gitlab-ci/checkov.yml` в `appsec-platform` (добавлен 2026-03-26)
+
+Checkov сканирует Terraform, Helm, Kubernetes YAML, Dockerfile на мисконфигурации.
+
+### Использование
+
+```yaml
+include:
+  - project: 'devops/appsec-platform'
+    ref: main
+    file: '/gitlab-ci/checkov.yml'
+```
+
+Три job'а — запускаются автоматически по наличию файлов в репо:
+- `checkov-scan` — всё сразу (`framework: all`), на MR/main/release
+- `checkov-terraform` — только при наличии `*.tf` файлов
+- `checkov-helm` — только при наличии `helm/**/*.yaml` или `k8s/**/*.yaml`
+
+### Переменные
+
+| Переменная | Описание | Дефолт |
+|---|---|---|
+| `CHECKOV_FRAMEWORK` | Что сканировать | `all` |
+| `CHECKOV_SKIP_CHECKS` | Чеки для пропуска (через запятую) | — |
+| `CHECKOV_SOFT_FAIL` | Не падать при нарушениях | `false` |
+
+### Пример `.checkov.yaml` в репо (whitelist)
+
+```yaml
+skip-check:
+  - CKV_K8S_8   # liveness probe — не обязательно для batch jobs
+  - CKV_DOCKER_2 # HEALTHCHECK — если используется docker-compose healthcheck
+```
+
+---
+
+## Security Gate — блокировка деплоя через DefectDojo
+
+**Шаблон:** `gitlab-ci/security-gate.yml` в `appsec-platform` (добавлен 2026-03-26)
+
+Блокирует деплой в прод если в DefectDojo есть **активные Critical/High findings** без accepted risk.
+
+### Схема пайплайна
+
+```
+scan (Trivy/Semgrep/ZAP/Checkov)
+  → upload-security (upload-to-dojo.yml)
+    → security-gate  ← ЗДЕСЬ БЛОКИРОВКА
+      → deploy (только если gate прошёл)
+```
+
+### Использование
+
+```yaml
+stages:
+  - scan
+  - upload-security
+  - security-gate
+  - deploy
+
+include:
+  - project: 'devops/appsec-platform'
+    ref: main
+    file: '/gitlab-ci/security-gate.yml'
+```
+
+### Переменные
+
+| Переменная | Описание | Дефолт |
+|---|---|---|
+| `DOJO_URL` | DefectDojo base URL | обязательно |
+| `DOJO_TOKEN` | API token | обязательно |
+| `DOJO_ENGAGEMENT_ID` | ID engagement | обязательно |
+| `SECURITY_GATE_SEVERITIES` | Что блокирует | `Critical,High` |
+| `SECURITY_GATE_SOFT_FAIL` | Не блокировать (только репортить) | `false` |
+
+### Логика фильтрации
+
+Gate считает только findings, которые:
+- `active=true` и `verified=true`
+- НЕ `risk_accepted`, НЕ `false_p`, НЕ `duplicate`, НЕ `out_of_scope`
+
+Как обойти блокировку легитимно:
+1. Принять риск в DefectDojo (`Accept Risk`)
+2. Отметить как False Positive
+3. Закрыть finding (исправить уязвимость)
+
+### Вывод при блокировке
+
+```
+🚨 GATE BLOCKED — 2 open finding(s):
+
+  [Critical ] #142 SQL Injection in UserController (app)
+  [High     ] #138 Outdated OpenSSL (base-image)
+
+  ➜ Fix, accept, or mark as false-positive in DefectDojo before deploying.
+  ➜ https://dojo.example.com/engagement/12/findings
+```
+
+### Онбординг новых проектов
+
+На старте рекомендуется `SECURITY_GATE_SOFT_FAIL=true` — gate репортирует но не блокирует.
+После разбора накопленного долга убрать флаг.
+
+---
+
 ## Официальная документация
 
 - Trivy: https://trivy.dev/latest/docs/
