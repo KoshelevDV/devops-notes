@@ -895,6 +895,233 @@ flux get all -n flux-system
 
 ---
 
+## Air-gap / закрытый контур (Nexus / Harbor)
+
+> Источник: https://fluxcd.io/flux/installation/configuration/air-gapped/
+
+Flux полностью поддерживает установку в изолированном контуре — нужны только:
+- приватный Git (GitLab self-hosted, Gitea и т.д.)
+- приватный container registry (Harbor, Nexus Docker hosted)
+- приватный Helm registry (Nexus Helm hosted/proxy, Harbor)
+
+### Шаг 1 — скопировать образы Flux в Harbor / Nexus
+
+На машине с доступом в интернет (jump host):
+
+```bash
+# Посмотреть какие образы нужны
+flux install --export | grep ghcr.io
+
+# Скопировать все образы в приватный registry
+FLUX_CONTROLLERS=(
+  "source-controller"
+  "kustomize-controller"
+  "helm-controller"
+  "notification-controller"
+  "image-reflector-controller"
+  "image-automation-controller"
+)
+
+for controller in "${FLUX_CONTROLLERS[@]}"; do
+  crane copy --all-tags \
+    ghcr.io/fluxcd/$controller \
+    harbor.internal.example.com/fluxcd/$controller
+done
+```
+
+`crane` — утилита от Google: https://github.com/google/go-containerregistry
+
+Альтернатива без crane:
+```bash
+for controller in "${FLUX_CONTROLLERS[@]}"; do
+  docker pull ghcr.io/fluxcd/$controller:latest
+  docker tag ghcr.io/fluxcd/$controller:latest harbor.internal.example.com/fluxcd/$controller:latest
+  docker push harbor.internal.example.com/fluxcd/$controller:latest
+done
+```
+
+### Шаг 2 — bootstrap с приватным registry
+
+**Harbor без авторизации (публичный проект):**
+```bash
+flux bootstrap git \
+  --registry=harbor.internal.example.com/fluxcd \
+  --url=ssh://git@gitlab.internal.example.com/platform/fleet-infra \
+  --branch=main \
+  --private-key-file=~/.ssh/flux_ed25519 \
+  --path=clusters/prod
+```
+
+**Harbor с авторизацией (приватный проект):**
+```bash
+flux bootstrap git \
+  --registry=harbor.internal.example.com/fluxcd \
+  --registry-creds=robot$flux:harbor-robot-token \
+  --image-pull-secret=harbor-regcred \
+  --url=ssh://git@gitlab.internal.example.com/platform/fleet-infra \
+  --branch=main \
+  --private-key-file=~/.ssh/flux_ed25519 \
+  --path=clusters/prod
+```
+
+Flux создаёт Secret `harbor-regcred` в `flux-system` namespace автоматически и прописывает его в podах контроллеров.
+
+Обновить credentials позже:
+```bash
+flux -n flux-system create secret oci harbor-regcred \
+  --username=robot\$flux \
+  --password=new-token
+```
+
+### Шаг 3 — HelmRepository через Nexus / Harbor прокси
+
+**Nexus как Helm proxy** (проксирует внешние репозитории):
+```yaml
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: HelmRepository
+metadata:
+  name: ingress-nginx
+  namespace: flux-system
+spec:
+  interval: 1h
+  url: https://nexus.internal.example.com/repository/helm-proxy/
+  secretRef:
+    name: nexus-auth
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: nexus-auth
+  namespace: flux-system
+stringData:
+  username: flux-reader
+  password: nexus-password
+```
+
+**Nexus Helm hosted** (локальные чарты, загруженные вручную):
+```yaml
+spec:
+  url: https://nexus.internal.example.com/repository/helm-hosted/
+```
+
+**Harbor как Helm registry (OCI):**
+```yaml
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: HelmRepository
+metadata:
+  name: my-charts
+  namespace: flux-system
+spec:
+  interval: 1h
+  type: oci
+  url: oci://harbor.internal.example.com/helm-charts
+  secretRef:
+    name: harbor-auth
+---
+apiVersion: v1
+kind: Secret  # тип dockerconfigjson для OCI
+metadata:
+  name: harbor-auth
+  namespace: flux-system
+type: kubernetes.io/dockerconfigjson
+stringData:
+  .dockerconfigjson: |
+    {
+      "auths": {
+        "harbor.internal.example.com": {
+          "username": "robot$flux",
+          "password": "harbor-robot-token"
+        }
+      }
+    }
+```
+
+Или создать через kubectl:
+```bash
+kubectl create secret docker-registry harbor-auth \
+  --namespace=flux-system \
+  --docker-server=harbor.internal.example.com \
+  --docker-username=robot\$flux \
+  --docker-password=harbor-robot-token
+```
+
+### Загрузка Helm чартов в Nexus / Harbor
+
+**Nexus hosted:**
+```bash
+# Скачать чарт снаружи
+helm pull ingress-nginx/ingress-nginx --version 4.10.0
+
+# Загрузить в Nexus
+curl -u user:pass \
+  --upload-file ingress-nginx-4.10.0.tgz \
+  https://nexus.internal.example.com/repository/helm-hosted/
+```
+
+**Harbor OCI:**
+```bash
+helm pull ingress-nginx/ingress-nginx --version 4.10.0
+helm push ingress-nginx-4.10.0.tgz oci://harbor.internal.example.com/helm-charts
+```
+
+### Nexus как Docker proxy для образов приложений
+
+В закрытом контуре приложения тоже тянут образы из Harbor/Nexus:
+- Nexus: создать **Docker proxy** репозиторий (проксирует docker.io, ghcr.io, quay.io)
+- Harbor: создать **proxy cache** проект для каждого внешнего registry
+
+Настроить containerd на нодах:
+```toml
+# /etc/containerd/config.toml
+[plugins."io.containerd.grpc.v1.cri".registry]
+  [plugins."io.containerd.grpc.v1.cri".registry.mirrors]
+    [plugins."io.containerd.grpc.v1.cri".registry.mirrors."docker.io"]
+      endpoint = ["https://harbor.internal.example.com/v2/dockerhub-proxy"]
+    [plugins."io.containerd.grpc.v1.cri".registry.mirrors."ghcr.io"]
+      endpoint = ["https://harbor.internal.example.com/v2/ghcr-proxy"]
+```
+
+### Bootstrap с self-signed сертификатом
+
+Если Nexus/Harbor используют внутренний CA:
+```bash
+# Добавить CA cert в flux-system
+kubectl create secret generic ca-cert \
+  --namespace=flux-system \
+  --from-file=ca.crt=./internal-ca.crt
+
+# В HelmRepository указать caSecretRef
+spec:
+  caSecretRef:
+    name: ca-cert
+```
+
+Или через `insecure: true` (только для dev, не для prod):
+```yaml
+spec:
+  insecure: true
+```
+
+### Итоговая схема для закрытого контура
+
+```
+[Интернет] → (периодически) → [Jump host / CI] → Harbor/Nexus
+                                                        │
+                                               ┌────────┴────────┐
+                                               │                 │
+                                          Docker images     Helm charts
+                                               │                 │
+                                    [Закрытый контур]            │
+                                               │                 │
+                                          k8s nodes          Flux HelmRepository
+                                               │
+                                    Flux controllers (из Harbor)
+                                               │
+                                    GitLab self-hosted (fleet-infra repo)
+```
+
+---
+
 ## Multi-cluster: dev / stage / preprod / prod
 
 > Источник: https://fluxcd.io/flux/guides/repository-structure/
