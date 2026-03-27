@@ -893,6 +893,396 @@ flux get all -n flux-system
 
 ---
 
+---
+
+## Multi-cluster: dev / stage / preprod / prod
+
+> Источник: https://fluxcd.io/flux/guides/repository-structure/
+
+### Подходы к организации репозитория
+
+#### 1. Monorepo (рекомендуется для большинства случаев)
+
+Все кластеры в одном репозитории, один branch (`main`). Разница между окружениями — через Kustomize overlays.
+
+```
+fleet-infra/
+├── apps/
+│   ├── base/             # общие HelmRelease, общие values
+│   ├── dev/              # patch: version >=1.0.0-alpha, replicas: 1
+│   ├── staging/          # patch: version >=1.0.0-alpha, replicas: 2
+│   ├── preprod/          # patch: version >=1.0.0, replicas: 2
+│   └── production/       # patch: version >=1.0.0, replicas: 3, HPA
+├── infrastructure/
+│   ├── base/             # общие контроллеры
+│   ├── controllers/      # cert-manager, ingress-nginx, metallb
+│   └── configs/          # cluster-issuers, NetworkPolicy, StorageClass
+└── clusters/
+    ├── dev/              # flux bootstrap path → кластер dev
+    ├── staging/
+    ├── preprod/
+    └── production/
+```
+
+**clusters/production/flux-system/** — автогенерируется bootstrap.
+**clusters/production/infrastructure.yaml** и **clusters/production/apps.yaml** — создаёшь сам:
+
+```yaml
+# clusters/production/infrastructure.yaml
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: infrastructure
+  namespace: flux-system
+spec:
+  interval: 1h
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+  path: ./infrastructure/controllers
+  prune: true
+  wait: true                  # ждать готовности всех ресурсов
+
+---
+# clusters/production/apps.yaml
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: apps
+  namespace: flux-system
+spec:
+  interval: 10m
+  dependsOn:
+    - name: infrastructure
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+  path: ./apps/production     # <-- env-специфичный overlay
+  prune: true
+```
+
+**Bootstrap для каждого кластера** (разные kubeconfig):
+```bash
+# dev
+flux bootstrap gitlab \
+  --kubeconfig=~/.kube/dev.yaml \
+  --hostname=gitlab.example.com \
+  --owner=platform \
+  --repository=fleet-infra \
+  --path=clusters/dev \
+  --branch=main
+
+# production
+flux bootstrap gitlab \
+  --kubeconfig=~/.kube/prod.yaml \
+  --hostname=gitlab.example.com \
+  --owner=platform \
+  --repository=fleet-infra \
+  --path=clusters/production \
+  --branch=main
+```
+
+Каждый кластер смотрит только в свой `path=clusters/<env>`, но черпает конфиги из общего `apps/` и `infrastructure/`.
+
+---
+
+#### 2. Repo per environment
+
+Отдельный Git репозиторий на каждое окружение.
+
+```
+fleet-infra-dev/        → только dev
+fleet-infra-staging/    → только staging
+fleet-infra-prod/       → только production (ограниченный доступ)
+```
+
+**Когда выбирать:**
+- Нужны разные права доступа (разработчики видят dev/staging, но не prod)
+- Production — очень чувствительный, хочется изолированный review процесс
+- Команды разные по каждому окружению
+
+**Минусы:**
+- Продвижение изменений между окружениями нужно делать вручную (или через CI)
+- Дублирование infrastructure кода
+
+---
+
+#### 3. Repo per team (platform + tenant модель)
+
+Platform team управляет инфраструктурой, dev-команды — своими приложениями.
+
+```
+# Platform repo
+fleet-infra/
+├── infrastructure/
+│   ├── base/
+│   ├── production/
+│   └── staging/
+├── clusters/
+│   ├── production/
+│   └── staging/
+└── teams/
+    ├── team-a/           # Kustomization → app-team-a repo
+    └── team-b/
+
+# App team repo (team-a/apps)
+apps/
+├── base/
+├── production/
+└── staging/
+```
+
+Platform team регистрирует репозиторий команды в Flux:
+```yaml
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: team-a-apps
+  namespace: team-a
+spec:
+  interval: 1m
+  url: https://gitlab.example.com/team-a/apps
+  ref:
+    branch: main
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: team-a-apps
+  namespace: team-a
+spec:
+  serviceAccountName: team-a         # RBAC ограничение — только свой namespace
+  sourceRef:
+    kind: GitRepository
+    name: team-a-apps
+  path: ./production
+  prune: true
+```
+
+---
+
+### Kustomize overlays — как работает патчинг
+
+**base** содержит общий HelmRelease, **overlay** переопределяет только нужные поля:
+
+```yaml
+# apps/base/myapp/release.yaml
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: myapp
+  namespace: myapp
+spec:
+  chart:
+    spec:
+      chart: myapp
+      sourceRef:
+        kind: HelmRepository
+        name: my-charts
+        namespace: flux-system
+  values:
+    replicaCount: 1
+    image:
+      tag: latest
+```
+
+```yaml
+# apps/production/myapp-patch.yaml — только diff!
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: myapp
+  namespace: myapp
+spec:
+  chart:
+    spec:
+      version: ">=1.0.0"       # только stable
+  values:
+    replicaCount: 3
+    resources:
+      requests:
+        cpu: 500m
+        memory: 256Mi
+    ingress:
+      hosts:
+        - host: myapp.prod.example.com
+```
+
+```yaml
+# apps/production/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../base/myapp
+patches:
+  - path: myapp-patch.yaml
+```
+
+---
+
+### Promotion: продвижение между окружениями
+
+**Вариант 1 — ручной через PR (рекомендуется для prod):**
+1. Merge в `main` → автодеплой в dev/staging
+2. После тестирования — PR в ветку `release/prod`, review, merge → деплой в prod
+
+**Вариант 2 — Image Automation (автоматический для dev/staging):**
+```yaml
+# Flux следит за новыми image tags в registry
+apiVersion: image.toolkit.fluxcd.io/v1beta2
+kind: ImageRepository
+metadata:
+  name: myapp
+  namespace: flux-system
+spec:
+  image: registry.example.com/myapp
+  interval: 1m
+---
+apiVersion: image.toolkit.fluxcd.io/v1beta2
+kind: ImagePolicy
+metadata:
+  name: myapp
+  namespace: flux-system
+spec:
+  imageRepositoryRef:
+    name: myapp
+  policy:
+    semver:
+      range: ">=1.0.0-0"      # для staging: alpha/beta тоже
+---
+# В HelmRelease values — маркер для автообновления
+# image: registry.example.com/myapp:1.2.3 # {"$imagepolicy": "flux-system:myapp"}
+```
+
+**Вариант 3 — GitLab CI pipeline продвигает через commit:**
+```yaml
+# .gitlab-ci.yml
+promote-to-staging:
+  stage: promote
+  script:
+    - git clone $FLEET_INFRA_REPO
+    - sed -i "s/tag: .*/tag: $CI_COMMIT_TAG/" fleet-infra/apps/staging/values-patch.yaml
+    - git commit -am "promote myapp $CI_COMMIT_TAG to staging"
+    - git push
+  only:
+    - tags
+```
+
+---
+
+### Secrets per environment
+
+Каждый кластер имеет **свой SOPS ключ** — секреты не перекрёстно расшифруемы:
+
+```
+.sops.yaml
+creation_rules:
+  - path_regex: clusters/dev/.*
+    age: age1dev...
+  - path_regex: clusters/staging/.*
+    age: age1staging...
+  - path_regex: clusters/production/.*
+    age: age1prod...
+```
+
+Или через Vault с разными role per cluster:
+```yaml
+# ClusterSecretStore для dev
+spec:
+  provider:
+    vault:
+      auth:
+        kubernetes:
+          role: "flux-dev"          # права только на dev secrets path
+
+# ClusterSecretStore для prod
+spec:
+  provider:
+    vault:
+      auth:
+        kubernetes:
+          role: "flux-prod"         # права только на prod secrets path
+```
+
+---
+
+### Multi-tenancy lockdown (опционально, для строгой изоляции)
+
+При bootstrap можно запретить cross-namespace refs и remote bases — каждый tenant видит только свои ресурсы:
+
+```yaml
+# clusters/production/flux-system/kustomization.yaml
+patches:
+  - patch: |
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --no-cross-namespace-refs=true
+    target:
+      kind: Deployment
+      name: "(kustomize-controller|helm-controller|notification-controller)"
+  - patch: |
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --no-remote-bases=true
+    target:
+      kind: Deployment
+      name: "kustomize-controller"
+```
+
+---
+
+### Типичная схема для 4 окружений
+
+```
+                    Git push → main
+                          │
+          ┌───────────────┼───────────────┐
+          ▼               ▼               ▼
+        dev             staging         preprod
+    (autoдеплой)      (автодеплой)    (автодеплой)
+                                          │
+                                    PR review + approve
+                                          │
+                                          ▼
+                                       prod
+                                   (только после
+                                    ручного merge)
+```
+
+**Что меняется между окружениями через overlays:**
+- `version` semver range в HelmRelease (alpha/beta для staging, только stable для prod)
+- `replicaCount` — меньше на dev, больше на prod
+- `resources` — limits/requests
+- `ingress.hosts` — домены
+- `values` специфичные (feature flags, connection strings через secrets)
+
+**Что одинаково для всех (base):**
+- Сами чарты (HelmRepository sources)
+- Структура HelmRelease (chart name, sourceRef)
+- Базовые labels и аннотации
+
+---
+
+### Полезные команды для multi-cluster
+
+```bash
+# Статус конкретного кластера
+flux get all -A --kubeconfig=~/.kube/prod.yaml
+
+# Сравнить что изменится (dry-run)
+flux diff kustomization apps --path ./apps/production --kubeconfig=~/.kube/prod.yaml
+
+# Принудительная reconciliation в prod
+flux reconcile kustomization apps \
+  --with-source \
+  --kubeconfig=~/.kube/prod.yaml
+
+# Проверить health перед promotion
+flux check --kubeconfig=~/.kube/staging.yaml
+```
+
+---
+
 ## Ссылки
 
 - Docs: https://fluxcd.io/flux/
