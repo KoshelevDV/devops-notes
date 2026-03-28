@@ -822,3 +822,52 @@ FROM pg_replication_slots;
 - [pg_upgrade](https://www.postgresql.org/docs/current/pgupgrade.html)
 - [pgBackRest](https://pgbackrest.org/) — рекомендуется для продакшена
 - [Barman](https://pgbarman.org/) — альтернатива pgBackRest
+
+---
+
+## Размер баз и таблиц
+
+```sql
+-- Размер всех баз данных
+SELECT datname,
+       pg_size_pretty(pg_database_size(datname)) AS size
+FROM pg_database
+ORDER BY pg_database_size(datname) DESC;
+
+-- Размер текущей БД
+SELECT pg_size_pretty(pg_database_size(current_database()));
+
+-- Размер всех таблиц (топ-20)
+SELECT schemaname,
+       tablename,
+       pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) AS total,
+       pg_size_pretty(pg_relation_size(schemaname||'.'||tablename))       AS table_only,
+       pg_size_pretty(pg_indexes_size(schemaname||'.'||tablename))        AS indexes
+FROM pg_tables
+WHERE schemaname NOT IN ('pg_catalog','information_schema')
+ORDER BY pg_total_relation_size(schemaname||'.'||tablename) DESC
+LIMIT 20;
+
+-- Размер конкретной таблицы
+SELECT pg_size_pretty(pg_total_relation_size('public.my_table'));
+
+-- Размер всех индексов
+SELECT indexrelname,
+       pg_size_pretty(pg_relation_size(indexrelid)) AS size
+FROM pg_stat_user_indexes
+ORDER BY pg_relation_size(indexrelid) DESC
+LIMIT 20;
+
+-- Размер всех схем
+SELECT schema_name,
+       pg_size_pretty(SUM(pg_total_relation_size(quote_ident(schema_name)||'.'||quote_ident(table_name)))) AS size
+FROM information_schema.tables
+WHERE schema_name NOT IN ('pg_catalog','information_schema')
+GROUP BY schema_name
+ORDER BY SUM(pg_total_relation_size(quote_ident(schema_name)||'.'||quote_ident(table_name))) DESC;
+```
+
+**Разница:**
+- `pg_relation_size` — только данные таблицы (heap)
+- `pg_indexes_size` — только индексы
+- `pg_total_relation_size` — таблица + индексы + TOAST
