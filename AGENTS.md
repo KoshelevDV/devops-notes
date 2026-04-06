@@ -2,8 +2,8 @@
 
 ## What is this
 
-Личная DevOps-вики Абобы. Заметки на русском языке — инструкции, гайды, решения
-задач из реальной практики. Ведёт AI-ассистент Afflictus по триггеру.
+Личная DevOps-вики Daniil. Заметки на русском языке — инструкции, гайды, решения
+задач из реальной практики. Ведёт AI-ассистент Hermes по триггеру.
 
 **Триггер:** `"Нужна заметка: <вопрос>"` → создать/обновить заметку, закоммитить, сообщить.
 
@@ -19,9 +19,14 @@ docker/        — образы, compose, registry, troubleshooting
 linux/         — команды, systemd, сеть, производительность
 security/      — CVE, hardening, секреты, аудит, AppSec
 networking/    — сети, DNS, firewall, VPN, балансировщики
+nginx/         — конфиги, security hardening, proxy
+databases/     — PostgreSQL, бэкапы, миграции, HA
+ci-cd/         — пайплайны, GitLab CI, деплой
 helm/          — чарты, values, репозитории
 git/           — workflow, хуки, troubleshooting
-ci-cd/         — пайплайны, GitLab CI, деплой
+ai/            — AI-агенты, RAG, автоматизация
+apps/          — инструменты и приложения
+api/           — API-справочники
 _template.md   — шаблон новой заметки
 README.md      — оглавление
 AGENTS.md      — этот файл
@@ -70,20 +75,10 @@ AGENTS.md      — этот файл
 - Дополнение к существующей теме → обновить существующий файл
 - Новый раздел → создать директорию, добавить в README.md оглавление
 
-## Status (2026-02-24)
+## Status (2026-04-06)
 
-### Существующие заметки
-- `networking/b2e-store-vs-remote-access.md` — B2E store-private/store-public/remote access (Mikrotik, HAProxy, split-DNS, X-Access-Type header)
-- `security/appsec-platform-stack.md` — AppSec платформа: Trivy + Dependency-Track + DefectDojo + Semgrep
-
-### TODO (темы для будущих заметок)
-- [ ] Trivy Operator установка и настройка в k8s
-- [ ] Dependency-Track + DefectDojo интеграция пошагово
-- [ ] GitLab CI reusable templates (include:)
-- [ ] Helm: rollback стратегии
-- [ ] k8s: debug failing pods (события, логи, exec)
-- [ ] Docker: multi-stage builds best practices
-- [ ] Renovate self-hosted setup
+Вики активно ведётся. Добавлены разделы: nginx/, databases/, ai/, apps/, api/.
+Заметок: ~45. Актуализация проведена 2026-04-06 (Hermes).
 
 ## How to run locally
 

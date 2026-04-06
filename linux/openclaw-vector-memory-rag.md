@@ -1,7 +1,9 @@
-# Векторная память (RAG) для OpenClaw с bge-m3 и llama-server
+# [ARCHIVED] Векторная память (RAG) для OpenClaw с bge-m3 и llama-server
 
-> Дата настройки: 2026-03-11  
-> Статус: ✅ работает в проде
+> ⚠️ **Устарело.** OpenClaw заменён на Hermes + OpenViking.
+> Актуальная заметка: [vector-memory-rag.md](./vector-memory-rag.md)
+>
+> Дата настройки: 2026-03-11 | Архивировано: 2026-04-06
 
 ## Что это и зачем
 

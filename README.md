@@ -2,7 +2,7 @@
 
 Личная вики с инструкциями, гайдами и решениями по DevOps-задачам.
 
-> Заметки ведёт AI-ассистент Afflictus. Триггер: **"Нужна заметка: <вопрос>"**
+> Заметки ведёт AI-ассистент Hermes. Триггер: **"Нужна заметка: <вопрос>"**
 
 ---
 
@@ -13,11 +13,16 @@
 | [Kubernetes](./kubernetes/) | k8s, etcd, ingress, helm, операторы |
 | [Docker](./docker/) | образы, compose, registry, troubleshooting |
 | [Linux](./linux/) | команды, systemd, сеть, производительность |
-| [Security](./security/) | CVE, hardening, секреты, аудит |
+| [Security](./security/) | CVE, hardening, секреты, аудит, AppSec |
 | [Networking](./networking/) | сети, DNS, firewall, VPN |
+| [Nginx](./nginx/) | конфиги, security hardening, proxy |
+| [Databases](./databases/) | PostgreSQL, бэкапы, миграции, HA |
+| [CI/CD](./ci-cd/) | пайплайны, GitLab CI, деплой |
 | [Helm](./helm/) | чарты, values, репозитории |
 | [Git](./git/) | workflow, хуки, troubleshooting |
-| [CI/CD](./ci-cd/) | пайплайны, GitLab CI, деплой |
+| [AI](./ai/) | AI-агенты, RAG, автоматизация |
+| [Apps](./apps/) | инструменты и приложения |
+| [API](./api/) | API-справочники (Яндекс и др.) |
 
 ---
 
