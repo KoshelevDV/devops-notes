@@ -553,6 +553,89 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
 ```
 
+### Тестовая роль: RO на namespace default (без secrets) + port-forward
+
+Встроенный ClusterRole `view` уже исключает `secrets` — это сделано намеренно в k8s,
+чтобы чтение секретов не давало доступ к SA-токенам. Поэтому не нужно вручную
+перечислять все ресурсы: достаточно забиндить `view` + добавить отдельную роль на portforward.
+
+`pods/portforward` требует глагол `create` (не get/list) — это особенность subresource API.
+
+```yaml
+# 1. Доп. роль — только port-forward
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: portforward-role
+  namespace: default
+rules:
+  - apiGroups: [""]
+    resources: ["pods/portforward"]
+    verbs: ["create"]
+---
+# 2. Биндинг view (RO на всё кроме secrets — встроено в ClusterRole view)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: test-user-view
+  namespace: default
+subjects:
+  - kind: User
+    name: test-user                    # заменить на реального пользователя/группу
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: view                           # встроенный: RO без secrets, roles, rolebindings
+  apiGroup: rbac.authorization.k8s.io
+---
+# 3. Биндинг port-forward
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: test-user-portforward
+  namespace: default
+subjects:
+  - kind: User
+    name: test-user
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: portforward-role
+  apiGroup: rbac.authorization.k8s.io
+```
+
+Проверка:
+```bash
+# Применить
+kubectl apply -f test-role.yaml
+
+# Убедиться что secrets недоступны
+kubectl auth can-i get secrets --as=test-user -n default
+# → no
+
+# Убедиться что pods доступны
+kubectl auth can-i get pods --as=test-user -n default
+# → yes
+
+# Убедиться что port-forward доступен
+kubectl auth can-i create pods/portforward --as=test-user -n default
+# → yes
+
+# Полный список разрешений
+kubectl auth can-i --list --as=test-user -n default
+```
+
+Что входит в ClusterRole `view` (актуально для k8s 1.28+):
+- core: pods, pods/log, pods/status, services, endpoints, configmaps, persistentvolumeclaims, replicationcontrollers, resourcequotas, namespaces, events
+- apps: deployments, daemonsets, statefulsets, replicasets
+- batch: jobs, cronjobs
+- autoscaling: horizontalpodautoscalers
+- networking.k8s.io: ingresses, networkpolicies
+- policy: poddisruptionbudgets
+- **НЕ входит**: secrets, roles, rolebindings, clusterroles, clusterrolebindings
+
+---
+
 ### Аудит прав
 
 ```bash
