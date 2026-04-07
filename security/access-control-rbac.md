@@ -570,7 +570,7 @@ metadata:
   namespace: default
 rules:
   - apiGroups: [""]
-    resources: ["pods/portforward"]
+    resources: ["pods/portforward", "services/portforward"]
     verbs: ["create"]
 ---
 # 2. Биндинг view (RO на всё кроме secrets — встроено в ClusterRole view)
@@ -617,8 +617,12 @@ kubectl auth can-i get secrets --as=test-user -n default
 kubectl auth can-i get pods --as=test-user -n default
 # → yes
 
-# Убедиться что port-forward доступен
+# Убедиться что port-forward на pod доступен
 kubectl auth can-i create pods/portforward --as=test-user -n default
+# → yes
+
+# Убедиться что port-forward на service доступен
+kubectl auth can-i create services/portforward --as=test-user -n default
 # → yes
 
 # Полный список разрешений
