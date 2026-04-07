@@ -644,3 +644,117 @@ kubectl create secret docker-registry harbor-pull-secret \
 - ESO provider: https://github.com/external-secrets/external-secrets/blob/main/docs/provider/infisical.md
 - Env vars docs: https://infisical.com/docs/self-hosting/configuration/envars
 - K8s deploy docs: https://infisical.com/docs/self-hosting/deployment-options/kubernetes-helm
+
+---
+
+## Миграция platform-secret → индивидуальные секреты (50+ сервисов)
+
+### Контекст
+
+- Один общий `platform-secret` с кредами Postgres (+ Redis, RabbitMQ и др. с общими кредами)
+- 50+ микросервисов
+- Цель: каждый сервис получает свой k8s Secret, наполняемый из Infisical
+- Изоляция между сервисами не нужна — одна Machine Identity для всего оператора
+
+### Структура секретов в Infisical
+
+```
+project: platform
+  environment: prod
+    /services/
+      /services/user-service/
+        DB_HOST, DB_USER, DB_PASSWORD, ...
+      /services/order-service/
+        DB_HOST, DB_USER, DB_PASSWORD, ...
+      /services/payment-service/
+        ...
+```
+
+Один проект, разные пути на сервис. Оператор ходит к каждому пути отдельно.
+
+### Helm-шаблон для генерации InfisicalSecret (50+ сервисов)
+
+Вместо ручного написания 50+ CRD — один шаблон + список сервисов в values.yaml.
+
+```yaml
+# templates/infisical-secret.yaml
+{{- range .Values.services }}
+---
+apiVersion: secrets.infisical.com/v1alpha1
+kind: InfisicalSecret
+metadata:
+  name: {{ .name }}-infisical
+  namespace: {{ $.Values.namespace }}
+spec:
+  hostAPI: {{ $.Values.infisical.hostAPI }}
+  authentication:
+    universalAuth:
+      credentialsRef:
+        secretName: infisical-operator-credentials
+        secretNamespace: infisical
+      secretsScope:
+        projectSlug: {{ $.Values.infisical.projectSlug }}
+        envSlug: {{ $.Values.infisical.envSlug }}
+        secretsPath: /services/{{ .name }}
+        recursive: false
+  managedKubeSecretReferences:
+    - secretName: {{ .name }}-secret
+      secretNamespace: {{ $.Values.namespace }}
+      creationPolicy: Owner
+  resyncInterval: 5m
+{{- end }}
+```
+
+```yaml
+# values.yaml
+infisical:
+  hostAPI: https://infisical.example.com/api
+  projectSlug: platform
+  envSlug: prod
+
+namespace: default
+
+services:
+  - name: user-service
+  - name: order-service
+  - name: payment-service
+  # ...одна строка на сервис
+```
+
+Добавление нового сервиса = одна строка в `values.yaml`. При использовании FluxCD раскатывается автоматически.
+
+### Стратегия миграции (zero-downtime)
+
+```
+1. Заполнить Infisical
+   └── Создать проект, Machine Identity, заполнить /services/<name>/ для каждого сервиса
+
+2. Установить Infisical Operator
+   └── helm install infisical-operator infisical-helm-charts/secrets-operator -n infisical
+
+3. Создать Secret с кредами оператора
+   └── kubectl create secret generic infisical-operator-credentials \
+         --from-literal=clientId=... \
+         --from-literal=clientSecret=... \
+         -n infisical
+
+4. Применить InfisicalSecret CRD для всех сервисов
+   └── Оператор создаёт индивидуальные k8s Secrets (<name>-secret)
+   └── Деплойменты НЕ трогать пока
+
+5. Проверить созданные Secrets
+   └── kubectl get secret user-service-secret -o yaml
+   └── Сверить ключи с текущим platform-secret
+
+6. Мигрировать Deployment-ы (по одному или пачкой)
+   └── Заменить secretRef: platform-secret → <name>-secret
+   └── Rolling update — даунтайма нет
+
+7. Удалить platform-secret после завершения
+```
+
+### Почему нативный Operator лучше ESO для этой задачи
+
+У ESO `secretsPath` задаётся в `SecretStore`, а не в `ExternalSecret`. Значит нужен отдельный SecretStore на каждый путь (= на каждый сервис). При 50+ сервисах это 50+ SecretStore объектов.
+
+У Infisical Operator `secretsPath` задаётся прямо в `InfisicalSecret` CRD — один шаблон закрывает все сервисы.
