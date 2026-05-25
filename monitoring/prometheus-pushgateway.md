@@ -216,3 +216,132 @@ spec:
 - [Infra Observability Stack (Prometheus + Grafana + VictoriaMetrics)](/kubernetes/infra-observability-stack.md) — полный мониторинг-стек
 - [Logging with Victorialogs Stack](/kubernetes/logging-victorialogs-stack.md) — логирование вместо Loki
 - [Secrets management в CI/CD](/security/secrets-management-cicd-containers.md) — как не слить токены при пуше метрик
+
+---
+
+## 🚀 Альтернатива: VictoriaMetrics без Pushgateway
+
+Если в стеке уже есть **VictoriaMetrics** (или VictoriaMetrics Cluster), Pushgateway не нужен. VM умеет принимать метрики напрямую через несколько протоколов push. Это избавляет от лишнего компонента и lifecycle-головной боли.
+
+### Механика
+
+```
+CI Job → push напрямую в /write → VictoriaMetrics → Grafana
+```
+
+VM принимает метрики push-методом через:
+- **InfluxDB line protocol** (`/write`)
+- **Prometheus remote write** (`/api/v1/write`)
+- **Graphite plaintext** (`/graphite`)
+- **JSON import** (`/api/v1/import`)
+
+Pushgateway **не нужен**. VM сам управляет retention (`--retentionPeriod`), метрики не зависают вечно.
+
+### Пример: Web Vitals JSON → VictoriaMetrics (InfluxDB line protocol)
+
+Исходный JSON (из автотестов):
+
+```json
+{
+ "test_name": "test_guest_checkout_from_item_page_cash[prod1:kargapole-desktop]",
+ "url": "https://kargapole.rbt.ru/basket/purchase/...",
+ "viewport": "desktop",
+ "region": "kargapole",
+ "prod": "prod1",
+ "git_sha": "3f0567b",
+ "lcp": 1360,
+ "cls": 0.011586077982420825,
+ "inp": 192,
+ "fcp": 564,
+ "ttfb": 366.7,
+ "dns": 6.2,
+ "tcp": 127.5,
+ "ssl": 102.6,
+ "redirect": 0,
+ "dom_content_loaded": 1943.1,
+ "load_event": 2117.6,
+ "hydration": 752.6,
+ "extras": { "navigations_count": 5 },
+ "status": {
+   "lcp": "good", "cls": "good", "inp": "good",
+   "fcp": "good", "ttfb": "good", "dns": "good",
+   "tcp": "ni", "ssl": "good", "redirect": "good",
+   "dom_content_loaded": "ni", "load_event": "good", "hydration": "good"
+ }
+}
+```
+
+Скрипт в CI-пайплайне (одна команда curl, без Pushgateway):
+
+```bash
+#!/bin/bash
+# push_to_vm.sh — пуш метрик из JSON напрямую в VictoriaMetrics
+
+JSON_FILE="$1"
+VM_URL="${VM_URL:-http://victoriametrics:8428}"
+
+# Извлекаем значения через jq
+TEST=$(jq -r '.test_name' "$JSON_FILE" | tr ' ' '_')
+REGION=$(jq -r '.region' "$JSON_FILE")
+VIEWPORT=$(jq -r '.viewport' "$JSON_FILE")
+PROD=$(jq -r '.prod' "$JSON_FILE")
+GIT_SHA=$(jq -r '.git_sha' "$JSON_FILE")
+
+LABELS="region=${REGION},viewport=${VIEWPORT},prod=${PROD},git_sha=${GIT_SHA},test=${TEST}"
+
+# InfluxDB line protocol: measurement labels key=val,key=val timestamp
+curl -s -X POST "${VM_URL}/write" --data-binary "
+web_vitals,${LABELS} lcp=$(jq '.lcp' "$JSON_FILE"),cls=$(jq '.cls' "$JSON_FILE"),fcp=$(jq '.fcp' "$JSON_FILE"),ttfb=$(jq '.ttfb' "$JSON_FILE"),inp=$(jq '.inp' "$JSON_FILE")
+network,${LABELS} dns=$(jq '.dns' "$JSON_FILE"),tcp=$(jq '.tcp' "$JSON_FILE"),ssl=$(jq '.ssl' "$JSON_FILE"),redirect=$(jq '.redirect' "$JSON_FILE")
+browser,${LABELS} dom_content_loaded=$(jq '.dom_content_loaded' "$JSON_FILE"),load_event=$(jq '.load_event' "$JSON_FILE"),hydration=$(jq '.hydration' "$JSON_FILE")
+test_meta,${LABELS} navigations_count=$(jq '.extras.navigations_count // 0' "$JSON_FILE")
+"
+
+echo "Pushed to ${VM_URL}/write"
+```
+
+### PromQL-запросы в Grafana
+
+Те же метрики, что и через Pushgateway, но с другим source:
+
+```promql
+# LCP по регионам за последний час
+avg(web_vitals_lcp{region=~"$region"}) by (region, test)
+
+# Trend: LCP за неделю
+avg_over_time(web_vitals_lcp{test=~"$test"}[7d])
+
+# Только «плохие» прогоны (статус был в Pushgateway-версии, здесь через threshold)
+web_vitals_lcp{viewport="desktop"} > 2500
+```
+
+### Pushgateway vs VictoriaMetrics direct push
+
+| Критерий | Pushgateway | VictoriaMetrics /write |
+|---|---|---|
+| Посредник | ✅ нужен | ❌ не нужен |
+| Lifecycle метрик | Надо чистить руками | Автоматический retention |
+| Память | Все метрики в RAM | Эффективное хранение на диске |
+| Долгосрочное хранение | Нет | Да (retentionPeriod) |
+| Масштабирование | 1 реплика (SPOF) | VM Cluster — горизонтально |
+| Метрики-сироты | Вечная проблема | Удаляются по TTL |
+| Протоколы | Только Prometheus exposition | InfluxDB, Prometheus remote write, Graphite, JSON |
+| Даунсэмплинг | Нет | Да (1m→5m→1h) |
+
+### Как выбрать
+
+**Pushgateway** — если:
+- Стек строго Prometheus, VM не планируется
+- Нужны метрики в PromQL из коробки без смены формата
+- Простота «закинул и забыл» на маленьком масштабе
+
+**VictoriaMetrics /write** — если:
+- VM уже есть в стеке
+- Важна долгосрочная история
+- Не хочется решать проблему «как чистить старые instance»
+- Нужен даунсэмплинг и эффективное хранение
+
+## 📎 Дополнительные источники
+
+- [VictoriaMetrics — How to import data](https://docs.victoriametrics.com/#how-to-import-time-series-data)
+- [InfluxDB line protocol spec](https://docs.influxdata.com/influxdb/v2/reference/syntax/line-protocol/)
