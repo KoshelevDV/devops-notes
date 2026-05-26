@@ -72,6 +72,8 @@ Prometheus, Grafana, Pushgateway, алерты
 | Article | Summary | Updated |
 |---------|---------|---------|
 | [Prometheus Pushgateway](monitoring/prometheus-pushgateway.md) | — | 2026-05-25 |
+| [VictoriaMetrics Cluster — архитектура](monitoring/victoria-metrics-cluster-architecture.md) | RBT: внешний VM-кластер, компоненты, потоки данных | 2026-05-26 |
+| [VictoriaMetrics — литьё метрик из автотестов](monitoring/victoria-metrics-autotest-push.md) | Как пушить web-vitals через `/api/v1/import/prometheus` | 2026-05-26 |
 | [Мониторинг серверов — железо и виртуалки](monitoring/server-monitoring-baremetal-vm.md) | — | 2026-04-07 |
 
 ## networking
